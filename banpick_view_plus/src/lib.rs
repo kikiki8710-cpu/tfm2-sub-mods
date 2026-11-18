@@ -1,0 +1,1358 @@
+//! banpick_view_plus — 밴픽 화면 개편 (daram2 원작 · 0.6.0 stable 포팅 2026-09-17).
+//! 원작(클래식): .ui 오버라이드(layout/blue·red_pick_slot) + post_render 렌더 명령 가로채기(호버 탐지·텍스처 치환·알파 캡·레이더·이름 색)
+//!            + 스킨 교체(스프라이트 치환 — **이 판에선 제외**, 유저 지시 09-17).
+//! stable 판:
+//!   · 레이아웃 = 원작 .ui 를 0.6.0 베이스에 3-way 머지(git merge-file, 0826 베이스, 충돌 0) → `mod.override_info` 로 교체(stable 모드도 적용됨: 실증)
+//!   · 텍스트 = `text/bvp.i18n` 을 `asset/base/text/ui` 에 merge(원작 그대로)
+//!   · 스플래시 = 픽 슬롯에 `bp_splash:image` 스폰, source = `asset/banpick_view_plus/illust/raw/<pack>/<stem>`(모드 폴더 자동 등록)
+//!   · 배경 = `main.bp_hover_bg` image source 교체 + 패널 색 알파 캡(`ui_set_properties color:`)
+//!   · 호버 = Win32 커서 → UI 좌표(1920×1080) → 카드/슬롯 rect 판정(stable 에 hover 이벤트 없음)
+//!   · 레이더 = `post_render` 에서 `draw_line/circle/text/sprite("UI", …)`
+//!   · 이름 색 = 카드 `name` 라벨 color. 픽 슬롯 챔피언 = `done.name` 텍스트 → 표시명→id 맵(i18n)
+//!   · 버프/너프·레이더 축 = 현재 `champion_brief` vs 번들 `champion_info` 시트(기본값) — 사거리/공속 축은 현재값 없음 → 0
+//! 설정 = mods\banpick_view_plus\banpick_view_plus.cfg / 스플래시 선택 = splash.cfg
+#![allow(dead_code)]
+#![cfg_attr(feature = "embedded", allow(unused_imports))] // 통합판 빌드: declare_stable_mod 미사용
+use mod_api_stable::{declare_stable_mod, LogLevel, StableClient, StableExtension, StableHost, StableMod, StableSpriteParams, TextAlignXV1, TextAlignYV1};
+use serde_json::Value;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
+#[path = "../../ui_kit/draft_scene_stable.rs"]
+mod draft_scene;
+#[path = "../../ui_kit/client_db_stable.rs"]
+mod cdb; // ★09-28: 출시분 챔피언 목록 raw 읽기(champion_names() 는 모드 챔프가 많을수록 수백 ms~수 초)
+mod showcase; // ★09-20: tfm2_banpick_illust 쇼케이스(밴/픽 연출 카드 일러) 통합 — 게임 훅 RVA 29(패치마다 재핀)
+#[path = "../../common/log_dir.rs"]
+mod log_dir; // ★10-21: 로그 폴더(`mods\_log_root.txt` 있으면 그 아래) — debug.log·radar_dump.txt·showcase_log.txt 만. splash.cfg·*.flag 는 모드 폴더 그대로
+
+const MOD_ID: &str = "banpick_view_plus";
+/// 에셋 경로의 모드 id(`asset/<id>/…` = 그 모드 폴더). 통합판(daram2_view_plus · feature "embedded")은 파일이 통합판 폴더에 있다(2026-11-11).
+///   모드 폴더(`mod_dir()`)는 원래부터 이 dll 의 폴더라 통합판에선 저절로 통합판 폴더가 된다.
+const ASSET_ID: &str = if cfg!(feature = "embedded") { "daram2_view_plus" } else { MOD_ID };
+/// debug.log 파일 이름 — 통합판은 7개 모듈이 한 폴더를 같이 써서 모듈 접두(단독판 = 그대로 `debug.log`).
+const DEBUG_LOG: &str = if cfg!(feature = "embedded") { "banpick_view_plus_debug.log" } else { "debug.log" };
+const RADAR_DUMP: bool = false; // ★10-07 레이더 실측 덤프(mods\banpick_view_plus\radar_dump.txt) — 릴리스 false
+/// 씬 phase 가 이 값 이상 = 양쪽 스왑 확정 후(8~9 = 전략 진입 · RE 10-15 `+0x3a8` · debug.log 10-14 실측 5→6→7→8→9). 스왑 결과 공개 기준.
+const PHASE_REVEAL: u32 = draft_scene::PHASE_SWAP + 1;
+const DBG: bool = false; // 09-23 확정 배포(진단 시 true — rects/layout/swap/카드덤프 로그)
+const ROOT: &str = "main";
+const DISC: &str = "main.header.bp_settings";
+const PANEL: &str = "main.bp_settings_panel";
+const HOVER_BG: &str = "main.bp_hover_bg";
+const CARDS: &str = "main.champions.contents";
+const PACK_USER: &str = "User_Splash_Art";
+/// ★09-20 유저 지시: 유저 그림 폴더 = 게임 로컬 `mods\banpick_view_plus\illust\{blue,red,red_noflip}` (구 일러 모드의 폴더 규칙을 이 모드 이름으로 — 워크샵 폴더가 아니라 갱신에 안 지워짐)
+#[cfg(not(feature = "embedded"))]
+const USER_ILLUST_DIR: &str = r"mods\banpick_view_plus\illust";
+/// 통합판: 유저 그림 폴더도 통합판 이름으로(`<게임>\mods\daram2_view_plus\illust\{blue,red,red_noflip}`).
+#[cfg(feature = "embedded")]
+const USER_ILLUST_DIR: &str = r"mods\daram2_view_plus\illust";
+const DEFAULT_ILLUST_PACK: &str = "kahluamik_illust";
+const MAX_LEVEL: usize = 12;
+// 레이아웃 상수(원작)
+const INFO_Y_ON: f32 = 745.0;
+const INFO_Y_OFF: f32 = 2000.0;
+const SCROLL_Y: f32 = 105.0;
+const CONTENTS_Y: f32 = 20.0;
+const VIEWPORT_H: f32 = 880.0;
+const SPACER_H: f32 = 10.0;
+const CARD_H: f32 = 135.0;
+const ROW_GAP: f32 = 11.0;   // layout.ui #contents child_type Table spacing_y
+const SCROLL_SLACK: f32 = 20.0;  // 게임이 스크롤 한계에서 떼어먹는 몫(= bar_padding top+bottom) — 0.6.1 실측
+const BOTTOM_GAP: f32 = 20.0;    // 마지막 줄 아래 보이는 여백
+const CARD_GAP: f32 = 10.0;
+const GRID_COLS: usize = 9;
+const SLOT_W: f32 = 300.0;
+const SLOT_H: f32 = 174.0;
+const BAR: f32 = 15.0;
+const ILLUST_ASPECT: f32 = 172.0 / 284.0;
+const COLOR_BUFF: &str = "#57db78ff";
+const COLOR_NERF: &str = "#f7666bff";
+const COLOR_NORMAL: &str = "#e8e8e8ff";
+/// (노드, 원색, 배경 켜짐 색)
+const DIM_NODES: [(&str, &str, &str); 5] = [
+    ("main.background", "#07080bff", "#07080b4d"),
+    ("main.header", "#161721ff", "#1617214d"),
+    ("main.bottom", "#161721ff", "#1617214d"),
+    ("main.champions_bg", "#161721ff", "#1617214d"),
+    ("main.champion_info.bp_panel_bg", "#07080bff", "#07080b4d"),
+];
+
+// ───────── 설정 ─────────
+#[derive(Clone, Copy)]
+struct Cfg { show_panel: bool, name_color: bool, red_noflip: bool, show_bg: bool, hero_bg: bool, showcase: bool, zoom: bool }
+static CFG: Mutex<Cfg> = Mutex::new(Cfg { show_panel: true, name_color: true, red_noflip: false, show_bg: false, hero_bg: false, showcase: true, zoom: false });
+fn cfg() -> Cfg { *CFG.lock().unwrap_or_else(|e| e.into_inner()) }
+fn cfg_mut(f: impl FnOnce(&mut Cfg)) { let mut g = CFG.lock().unwrap_or_else(|e| e.into_inner()); f(&mut g); let c = *g; drop(g); save_cfg(&c); }
+/// ★설정 저장소 = 원작과 같은 공용 파일 `<게임>\ModData\config.txt`(키: show_panel/banpick_name_color/banpick_red_noflip/banpick_show_bg/banpick_hero_bg).
+///   2026-09-17: 모드 폴더 자체 cfg 를 쓰다 보니 원작에서 꺼 두었던 배경 옵션이 켜진 채 남았다(유저 제보) → 원작 파일을 정본으로.
+///   다른 뷰플러스 모드 키는 건드리지 않는다(있는 줄은 값만 교체, 없는 키만 끝에 추가).
+fn shared_cfg_path() -> Option<String> { exe_dir().map(|d| format!(r"{}\ModData\config.txt", d)) }
+fn cfg_apply_line(c: &mut Cfg, l: &str) {
+    let Some((k, v)) = l.split_once('=') else { return };
+    let b = matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "on" | "yes");
+    match k.trim() { "show_panel" => c.show_panel = b, "banpick_name_color" => c.name_color = b, "banpick_red_noflip" => c.red_noflip = b, "banpick_show_bg" => c.show_bg = b, "banpick_hero_bg" => c.hero_bg = b, "banpick_showcase" => c.showcase = b, "banpick_zoom" => c.zoom = b, _ => {} }
+}
+fn load_cfg() -> Cfg {
+    let mut c = Cfg { show_panel: true, name_color: true, red_noflip: false, show_bg: false, hero_bg: false, showcase: true, zoom: false };
+    if let Some(t) = shared_cfg_path().and_then(|p| std::fs::read_to_string(p).ok()) { for l in t.lines() { cfg_apply_line(&mut c, l); } }
+    c
+}
+fn save_cfg(c: &Cfg) {
+    let Some(p) = shared_cfg_path() else { return };
+    let mut lines: Vec<String> = std::fs::read_to_string(&p).map(|t| t.lines().map(|l| l.to_string()).collect()).unwrap_or_default();
+    let pairs = [("show_panel", c.show_panel), ("banpick_name_color", c.name_color), ("banpick_red_noflip", c.red_noflip), ("banpick_show_bg", c.show_bg), ("banpick_hero_bg", c.hero_bg), ("banpick_showcase", c.showcase), ("banpick_zoom", c.zoom)];
+    for (k, v) in pairs {
+        let line = format!("{} = {}", k, v);
+        match lines.iter_mut().find(|l| l.split_once('=').map(|(a, _)| a.trim() == k).unwrap_or(false)) { Some(l) => *l = line, None => lines.push(line) }
+    }
+    if let Some(d) = std::path::Path::new(&p).parent() { let _ = std::fs::create_dir_all(d); }
+    let _ = std::fs::write(&p, lines.join("
+") + "
+");
+}
+/// base("bg"/챔프id/question_blue…) → "pack/stem"
+static SPLASH_SEL: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+fn splash_sel() -> HashMap<String, String> { SPLASH_SEL.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(load_splash).clone() }
+fn splash_path() -> Option<String> { mod_dir().map(|d| format!(r"{}\splash.cfg", d)) }
+fn load_splash() -> HashMap<String, String> {
+    let mut m = HashMap::new();
+    if let Some(t) = splash_path().and_then(|p| std::fs::read_to_string(p).ok()) { for l in t.lines() { if let Some((k, v)) = l.split_once('=') { m.insert(k.trim().to_string(), v.trim().to_string()); } } }
+    m
+}
+fn set_splash(base: &str, key: &str) {
+    let mut g = SPLASH_SEL.lock().unwrap_or_else(|e| e.into_inner());
+    let m = g.get_or_insert_with(load_splash);
+    m.insert(base.to_string(), key.to_string());
+    if let Some(p) = splash_path() { let mut s = String::new(); let mut ks: Vec<_> = m.iter().collect(); ks.sort(); for (k, v) in ks { s.push_str(&format!("{}={}\n", k, v)); } let _ = std::fs::write(p, s); }
+}
+
+// ───────── 공통 ─────────
+static FRAME: AtomicU64 = AtomicU64::new(0);
+static ACTIVE: AtomicBool = AtomicBool::new(false);
+static CLICKS_REGISTERED: AtomicBool = AtomicBool::new(false);
+static SETTINGS_OPEN: AtomicBool = AtomicBool::new(false);
+static STAGED: Mutex<Option<usize>> = Mutex::new(None); // 풀다운 행(pack_rows) 인덱스 — 마지막으로 일괄 적용한 팩
+/// ★10-14(Flover 요청 「옆으로 넘기기 말고 아래로 스크롤」): 팩 일괄 적용 = 좌우 순환 → 풀다운 목록. 행은 첫 펼침 때 스폰(밴픽 씬마다 재생성).
+static PACK_LIST_OPEN: AtomicBool = AtomicBool::new(false);
+static PACK_ROW_CLICKS: Mutex<Option<BTreeSet<String>>> = Mutex::new(None); // 클릭 등록한 행 경로(경로 키 영구 → 경로당 1회)
+static PENDING_CLICKS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// 픽 슬롯 → 챔프 id (is_blue, n)
+static SLOT_CHAMP: Mutex<Option<HashMap<(bool, usize), String>>> = Mutex::new(None);
+static HOVER: Mutex<Option<(String, (f32, f32, f32, f32))>> = Mutex::new(None); // 호버 챔프 + 카드 rect
+static HOVER_BG_KEY: Mutex<Option<String>> = Mutex::new(None);
+static SLOT_GRACE: Mutex<[u64; 10]> = Mutex::new([0; 10]);
+// ★성능(2026-09-17 유저 제보 "밴픽이 엄청 느려"): 카드 160장 × 호스트 호출 수백 회/틱을 캐시로 줄인다.
+//   · CARDS_CACHE = 카드 id 목록(자식 수가 바뀌거나 90틱마다 갱신)
+//   · RECT_CACHE = 카드 rect(첫 카드 rect 가 바뀔 때 = 스크롤 때만 재측정)
+//   · FLAG_CACHE = 픽 오버레이(.blue/.red visible) — done 슬롯 집합이 바뀐 뒤 15틱 동안만 재스캔
+static CARDS_CACHE: Mutex<Option<(usize, u64, Vec<String>)>> = Mutex::new(None); // (child_count, 갱신 틱, ids)
+static RECT_CACHE: Mutex<Option<((f32, f32, f32, f32), Vec<(String, (f32, f32, f32, f32))>)>> = Mutex::new(None); // (첫 카드 rect, [(id, rect)])
+static FLAG_CACHE: Mutex<(Vec<(bool, usize)>, u64, Vec<(bool, String)>)> = Mutex::new((Vec::new(), 0, Vec::new())); // (done 집합, 마지막 변화 틱, flagged)
+fn cards_cached(ctx: &StableClient<'_>, f: u64) -> Vec<String> {
+    let n = ctx.ui_child_count(CARDS).unwrap_or(0);
+    let mut g = CARDS_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((cn, at, ids)) = g.as_ref() { if *cn == n && f.saturating_sub(*at) < 90 { return ids.clone(); } }
+    let ids = ctx.ui_child_names(CARDS);
+    *g = Some((n, f, ids.clone()));
+    *RECT_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    ids
+}
+#[derive(Default)]
+struct PickState { slot_champ: HashMap<(bool, usize), String>, known: Vec<(bool, String)> }
+static PICK_STATE: Mutex<Option<PickState>> = Mutex::new(None);
+/// ★09-18 스왑 추적(유저 제보 "스왑해도 이미지 안 바뀜"): 0.6.0 스왑 표 행(swap_slot_n)의 이름/포지션 텍스트는 stable API 로 못 읽는다(runner None).
+///   대신 행 클릭을 등록해 게임의 스왑 조작(행 A 선택 → 행 B 클릭 = A↔B 챔피언 교환 / 같은 행 재클릭 = 선택 해제)을 그대로 따라간다.
+///   행 k ↔ 픽 슬롯 = 같은 팀 pick_slot_n 을 y 오름차순으로 정렬한 k 번째(둘 다 라인업 순서 = 탑→서폿). ⚠코치 위임·상대 AI 스왑은 클릭이 없어 추적 불가(한계).
+static SWAP_SEL: Mutex<[Option<usize>; 2]> = Mutex::new([None, None]);
+static SWAP_ACTIVE: AtomicBool = AtomicBool::new(false);
+static HIDE_SIDE_LOG: AtomicBool = AtomicBool::new(false);
+static BOTTOM_DUMPED: AtomicBool = AtomicBool::new(false);
+static CARD_DUMPED: AtomicBool = AtomicBool::new(false);  // 상대 일러 ? 처리 전환 로그 1회용
+static SWAP_LAST_CLICK: Mutex<Option<(u64, String)>> = Mutex::new(None);
+static NAME_MAP: Mutex<Option<HashMap<String, String>>> = Mutex::new(None); // 표시명 → id
+static AXES: Mutex<Option<HashMap<String, [f32; 8]>>> = Mutex::new(None);
+static NAME_COLOR: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+static DIM_STATE: AtomicBool = AtomicBool::new(false);
+static SHEET: Mutex<Option<HashMap<String, SheetEntry>>> = Mutex::new(None);
+static ILLUST: Mutex<Option<std::sync::Arc<Illust>>> = Mutex::new(None);
+static LAST_LAYOUT: Mutex<(f32, f32)> = Mutex::new((-1.0, -1.0));
+static LAST_BG: Mutex<Option<String>> = Mutex::new(None);
+static LAST_SPLASH: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+static BLUE_NAME: Mutex<Option<HashMap<String, (String, String)>>> = Mutex::new(None); // 블루 이름 경로 → (이름 글자, 적용한 속성)
+static PROF_X: Mutex<Option<HashMap<String, (f32, f32)>>> = Mutex::new(None); // 픽 완료 블록 경로 → (숙련 제목 x, 알약 x) ui px — fix_card_labels 가 매 프레임 씀
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetModuleFileNameW(module: usize, buf: *mut u16, size: u32) -> u32;
+    fn GetCurrentProcessId() -> u32;
+}
+#[link(name = "user32")]
+extern "system" {
+    fn GetCursorPos(p: *mut [i32; 2]) -> i32;
+    fn GetForegroundWindow() -> usize;
+    fn GetWindowThreadProcessId(h: usize, pid: *mut u32) -> u32;
+    fn ScreenToClient(h: usize, p: *mut [i32; 2]) -> i32;
+    fn GetClientRect(h: usize, r: *mut [i32; 4]) -> i32;
+}
+fn exe_dir() -> Option<String> {
+    let mut buf = [0u16; 520];
+    let n = unsafe { GetModuleFileNameW(0, buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    if n == 0 || n >= buf.len() { return None; }
+    let exe = String::from_utf16_lossy(&buf[..n]);
+    exe.rfind(|c| c == '\\' || c == '/').map(|i| exe[..i].to_string())
+}
+/// 이 dll 이 있는 폴더(워크숍 폴더일 수 있어 exe 기준 mods\ 로 잡지 않는다)
+fn mod_dir() -> Option<String> {
+    #[link(name = "kernel32")]
+    extern "system" { fn GetModuleHandleExW(flags: u32, addr: *const u16, h: *mut usize) -> i32; }
+    let mut h: usize = 0;
+    if unsafe { GetModuleHandleExW(0x4 | 0x2, mod_dir as *const () as *const u16, &mut h) } == 0 || h == 0 { return None; }
+    let mut buf = [0u16; 1024];
+    let n = unsafe { GetModuleFileNameW(h, buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    if n == 0 || n >= buf.len() { return None; }
+    let p = String::from_utf16_lossy(&buf[..n]);
+    p.rfind(|c| c == '\\' || c == '/').map(|i| p[..i].to_string())
+}
+/// ★10-14 레드 ⚙ 클릭 불가 진단: 모드 폴더에 `bp_diag.flag` 가 있으면(밴픽 화면 진입 때 확인) DBG 없이도 debug.log 기록 + ⚙ 위치 히트 노드 덤프.
+static DIAG: AtomicBool = AtomicBool::new(false);
+static DIAG_LAST: Mutex<String> = Mutex::new(String::new());
+static SLOTKIDS_LAST: Mutex<String> = Mutex::new(String::new());
+static ZTEST_LOGGED: AtomicBool = AtomicBool::new(false);
+fn log(s: &str) {
+    if !DBG && !DIAG.load(Ordering::Relaxed) { return; }
+    if let Some(d) = mod_dir() {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(format!(r"{}\{}", log_dir::log_dir(&d), DEBUG_LOG)) { let _ = writeln!(f, "[f{}] {}", FRAME.load(Ordering::Relaxed), s); }
+    }
+}
+/// 커서 → UI 좌표(1920×1080). 게임 창이 전면이 아니면 None.
+fn cursor_ui() -> Option<(f32, f32)> {
+    unsafe {
+        let h = GetForegroundWindow(); if h == 0 { return None; }
+        let mut pid = 0u32; GetWindowThreadProcessId(h, &mut pid);
+        if pid != GetCurrentProcessId() { return None; }
+        let mut p = [0i32; 2]; if GetCursorPos(&mut p) == 0 { return None; }
+        if ScreenToClient(h, &mut p) == 0 { return None; }
+        let mut r = [0i32; 4]; if GetClientRect(h, &mut r) == 0 || r[2] <= 0 || r[3] <= 0 { return None; }
+        Some((p[0] as f32 * 1920.0 / r[2] as f32, p[1] as f32 * 1080.0 / r[3] as f32))
+    }
+}
+fn inside(r: (f32, f32, f32, f32), p: (f32, f32)) -> bool { p.0 >= r.0 && p.0 <= r.0 + r.2 && p.1 >= r.1 && p.1 <= r.1 + r.3 }
+
+// ───────── 번들 시트(기본 스탯) ─────────
+#[derive(Clone, Default)]
+struct SheetEntry { stat: [f32; 6], growth: [f32; 6], cooltime: f32, range: f32 }
+fn stat6(v: &Value) -> [f32; 6] { let g = |k: &str| v.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0) as f32; [g("attack"), g("magic_power"), g("hp"), g("defence"), g("magic_resistance"), g("move_speed")] }
+fn load_sheet() -> HashMap<String, SheetEntry> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut out = HashMap::new();
+    let Some(dir) = exe_dir() else { return out };
+    let Ok(mut f) = std::fs::File::open(format!(r"{}\bundle.game_data", dir)) else { return out };
+    let mut u = [0u8; 4]; if f.read_exact(&mut u).is_err() { return out; }
+    let mut body: Option<Vec<u8>> = None;
+    for _ in 0..100_000 {
+        if f.read_exact(&mut u).is_err() { break; }
+        let el = u32::from_le_bytes(u) as usize; if el == 0 || el > 64 { break; }
+        let mut e = vec![0u8; el]; if f.read_exact(&mut e).is_err() { break; }
+        if f.read_exact(&mut u).is_err() { break; }
+        let pl = u32::from_le_bytes(u) as usize; if pl > 1024 { break; }
+        let mut path = vec![0u8; pl]; if f.read_exact(&mut path).is_err() { break; }
+        if f.read_exact(&mut u).is_err() { break; }
+        let bl = u32::from_le_bytes(u) as u64;
+        if path == b"asset/base/setting/champion_info" { let mut b = vec![0u8; bl as usize]; if f.read_exact(&mut b).is_ok() { body = Some(b); } break; }
+        if f.seek(SeekFrom::Current(bl as i64)).is_err() { break; }
+    }
+    let Some(b) = body else { return out };
+    let Ok(v) = serde_json::from_slice::<Value>(&b) else { return out };
+    let mut push = |name: &str, e: &Value| { out.insert(name.to_string(), SheetEntry { stat: e.get("stat").map(stat6).unwrap_or_default(), growth: e.get("growth").map(stat6).unwrap_or_default(), cooltime: e.get("attack").and_then(|a| a.get("cooltime")).and_then(|x| x.as_f64()).unwrap_or(0.0) as f32, range: e.get("attack").and_then(|a| a.get("range")).and_then(|x| x.as_f64()).unwrap_or(0.0) as f32 }); };
+    if let Some(m) = v.as_object() { for (k, e) in m { if k == "mod_champions" { if let Some(arr) = e.as_array() { for e in arr { if let Some(id) = e.get("id").and_then(|x| x.as_str()) { push(id, e); } } } } else if e.is_object() { push(k, e); } } }
+    out
+}
+fn sheet() -> HashMap<String, SheetEntry> { SHEET.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(load_sheet).clone() }
+/// 축 8개 = [attack, magic, hp, def, mr, move, range, atkspeed] 상대변화(원작 compute_radar). 사거리·공속은 현재값 API 없음 → 0.
+fn compute_axes(ctx: &StableClient<'_>) -> HashMap<String, [f32; 8]> {
+    let sh = sheet();
+    // ★09-28 렉 수정: ~~ctx.champion_names()~~(모드 챔프가 많을수록 수백 ms~수 초 — 밴픽 진입마다 불려 초기화 전 화면("test")이
+    //   멈춘 채 보이던 원인 · 실측 98종 577ms) → 출시분 raw 목록(0.07ms). 전체 13ms(시트 10ms 포함).
+    let names = cdb::champion_ids_fast(ctx);
+    let mut out = HashMap::new(); let lv = (MAX_LEVEL - 1) as f32;
+    let mut dump: Vec<String> = Vec::new(); // ★10-07 RADAR_DUMP(진단) — 기준(번들 시트)·현재(champion_brief)·축
+    for name in names {
+        let Some(b) = ctx.champion_brief(&name) else { if RADAR_DUMP { dump.push(format!("{}\tNO_BRIEF", name)); } continue };
+        let mut axes = [0f32; 8];
+        let cur = [b.stat.attack, b.stat.magic_power, b.stat.hp, b.stat.defence, b.stat.magic_resistance, b.stat.move_speed].map(|x| x as f32);
+        let cg = [b.growth.attack, b.growth.magic_power, b.growth.hp, b.growth.defence, b.growth.magic_resistance, b.growth.move_speed].map(|x| x as f32);
+        if let Some(e) = sh.get(&name) {
+            for k in 0..6 { let isum = e.stat[k] + (e.stat[k] + e.growth[k] * lv); if isum > 0.0 { axes[k] = (cur[k] + (cur[k] + cg[k] * lv) - isum) / isum; } }
+            if RADAR_DUMP {
+                dump.push(format!("{}\tbase_stat={:?}\tbase_grow={:?}\tcur_stat={:?}\tcur_grow={:?}\taxes%={:?}\tnet%={:.2}\trange={}\tcooltime={}",
+                    name, e.stat, e.growth, cur, cg, axes.map(|a| (a * 10000.0).round() / 100.0), axes.iter().sum::<f32>() * 100.0, e.range, e.cooltime));
+            }
+        } else if RADAR_DUMP {
+            dump.push(format!("{}\tNO_SHEET\tcur_stat={:?}\tcur_grow={:?}", name, cur, cg));
+        }
+        out.insert(name, axes);
+    }
+    if RADAR_DUMP {
+        if let Some(d) = mod_dir() { let _ = std::fs::write(format!(r"{}\radar_dump.txt", log_dir::log_dir(&d)), dump.join("\n")); }
+    }
+    out
+}
+fn tint_of(axes: &[f32; 8]) -> i8 { let net: f32 = axes.iter().sum(); if net > 0.01 { 1 } else if net < -0.01 { -1 } else { 0 } }
+
+// ───────── 일러스트 인덱스 ─────────
+#[derive(Default, Clone)]
+struct Illust {
+    /// stem → packs (팩 우선순 유지)
+    packs: HashMap<String, Vec<String>>,
+    pack_order: Vec<String>,
+    /// (pack, 표시명, layer n)
+    vpacks: Vec<(String, String, u32)>,
+    /// ★09-20 구 tfm2_banpick_illust 폴더 규칙 복원: `illust\red\<stem>.png`(red_noflip=0 일 때) / `illust\red_noflip\<stem>.png`(red_noflip=1 일 때)
+    ///   가 있으면 레드 진영은 그 그림을 반전 없이 쓴다. 없으면 blue 그림을 red_noflip 설정대로 반전/비반전.
+    red: BTreeSet<String>,
+    red_noflip: BTreeSet<String>,
+}
+fn stem_layer(stem: &str) -> u32 { stem.rsplit_once('-').and_then(|(_, n)| n.parse().ok()).unwrap_or(0) }
+fn stem_base(stem: &str) -> String { match stem.rsplit_once('-') { Some((b, n)) if n.parse::<u32>().is_ok() => b.to_string(), _ => stem.to_string() } }
+fn read_enabled_mods() -> Vec<String> {
+    let Some(dir) = exe_dir() else { return Vec::new() };
+    let Ok(t) = std::fs::read_to_string(format!(r"{}\config\game\mods.json", dir)) else { return Vec::new() };
+    serde_json::from_str::<Value>(&t).ok().and_then(|v| v.get("enabled_mods").and_then(|a| a.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())).unwrap_or_default()
+}
+/// 0.7.0 환경설정 UI 스타일(`config\game\base.json` `ui_style` = Classic | Light | Dark). 신규(Light·Dark)면 true. 파일·키가 없으면 false(기존).
+fn read_new_ui_style() -> bool {
+    let Some(dir) = exe_dir() else { return false };
+    let Ok(t) = std::fs::read_to_string(format!(r"{}\config\game\base.json", dir)) else { return false };
+    serde_json::from_str::<Value>(&t).ok().and_then(|v| v.get("ui_style").and_then(|s| s.as_str()).map(|s| s != "Classic")).unwrap_or(false)
+}
+static NEW_UI: AtomicBool = AtomicBool::new(false);
+fn find_mod_dir(id: &str) -> Option<String> {
+    let dir = exe_dir()?;
+    let local = format!(r"{}\mods\{}", dir, id);
+    if std::path::Path::new(&local).is_dir() { return Some(local); }
+    // 워크숍: steamapps/workshop/content/3009300/<item>/  (mod_info.mod_id 대조)
+    let ws = format!(r"{}\..\..\workshop\content\3009300", dir);
+    if let Ok(rd) = std::fs::read_dir(&ws) {
+        for e in rd.flatten() {
+            let p = e.path(); let mi = p.join("mod.mod_info");
+            if let Ok(t) = std::fs::read_to_string(&mi) { if let Ok(v) = serde_json::from_str::<Value>(&t) { if v.get("mod_id").and_then(|x| x.as_str()) == Some(id) { return p.to_str().map(str::to_string); } } }
+        }
+    }
+    None
+}
+fn modinfo_name(dir: &str) -> Option<String> { std::fs::read_to_string(format!(r"{}\mod.mod_info", dir)).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()).and_then(|v| v.get("name").and_then(|x| x.as_str()).map(str::to_string)) }
+/// 원작 prepare_illust 축약: 유저 그림(★09-20 유저 지시: 루트 우선순위 본 모드 폴더 → ModData → 워크샵, 각 `blue/red/red_noflip`)
+///   + 활성 모드들의 BanPickIllust\ → <mod_dir>\illust\raw\<pack>\<stem>.png 로 복사(크기 다르면 갱신 · 같은 파일명은 앞선 루트 우선) → 인덱스.
+///   레드 전용 구도 = `USER_ILLUST_DIR\red\<stem>.png`(red_noflip=0) / `red_noflip\`(=1) — 있으면 레드 진영에 반전 없이, 없으면 blue 반전. 구 tfm2_banpick_illust 규칙.
+///   레드 파일은 에셋 경로가 모드 폴더 기준이라 `raw\_red\`·`raw\_red_noflip\` 캐시로 복사해 쓴다(`_` 접두 = 팩 인덱스에서 제외).
+fn prepare_illust() -> Illust {
+    let mut il = Illust::default();
+    let Some(md) = mod_dir() else { return il };
+    let raw = format!(r"{}\illust\raw", md); let _ = std::fs::create_dir_all(&raw);
+    let mut sources: Vec<(String, String, String)> = Vec::new(); // (pack, dir, 표시명) — 같은 팩에 여러 소스면 앞선 것이 우선(first-wins)
+    // ★09-20 유저 지시: 유저 그림 루트 우선순위 = ①본 모드 폴더 `<게임>\mods\banpick_view_plus\illust` → ②`<게임>\ModData\illust` → ③워크샵 모드 폴더 `illust`
+    //   각 루트 아래 `blue\`(=기본) · `red\` · `red_noflip\`. ②는 원작 호환으로 `User_Splash_Art\` 도 blue 로, ③은 루트 직속 png 도 blue 로 본다.
+    let game = exe_dir().unwrap_or_default();
+    let roots: Vec<String> = vec![format!(r"{}\{}", game, USER_ILLUST_DIR), format!(r"{}\ModData\illust", game), format!(r"{}\illust", md)];
+    // ★통합판(11-12 1호기 결함 「대기 슬롯 ? 그림 안 나옴」): 단독판 유저 그림 폴더 `<게임>\mods\banpick_view_plus\illust` 도 읽는다
+    //   (통합판 폴더 바로 다음 우선순위 = 단독판에서 ①이던 자리). 안 읽으면 거기 둔 question_blue/red·챔피언 그림이 통째로 빠졌다.
+    //   단독판(로컬)에선 이 폴더가 ①이자 ③이었으므로 루트 직속 png 도 blue 로 본다. 단독판 빌드엔 이 줄이 없다(루트 3개 그대로).
+    #[cfg(feature = "embedded")]
+    let roots = { let mut r = roots; r.insert(1, format!(r"{}\mods\{}\illust", game, MOD_ID)); r };
+    // 루트별 특례 인덱스: ModData = `User_Splash_Art\` 도 blue · 「루트 직속 png 도 blue」 = 모드 폴더(③)(+통합판의 단독판 폴더)
+    let (i_moddata, i_direct): (usize, &[usize]) = if roots.len() == 4 { (2, &[1, 3]) } else { (1, &[2]) };
+    for d in ["blue", "red", "red_noflip"] { let _ = std::fs::create_dir_all(format!(r"{}\{}", roots[0], d)); }
+    let is_dir = |p: &str| std::path::Path::new(p).is_dir();
+    for (i, r) in roots.iter().enumerate() {
+        let blue = format!(r"{}\blue", r); if is_dir(&blue) { sources.push((PACK_USER.into(), blue, String::new())); }
+        if i == i_moddata { let u = format!(r"{}\{}", r, PACK_USER); if is_dir(&u) { sources.push((PACK_USER.into(), u, String::new())); } }
+        if i_direct.contains(&i) && is_dir(r) { sources.push((PACK_USER.into(), r.clone(), String::new())); }
+        let red = format!(r"{}\red", r); if is_dir(&red) { sources.push(("_red".into(), red, String::new())); }
+        let rnf = format!(r"{}\red_noflip", r); if is_dir(&rnf) { sources.push(("_red_noflip".into(), rnf, String::new())); }
+    }
+    let mut baseline: Option<(String, String, String)> = None;
+    for id in read_enabled_mods() {
+        if id == MOD_ID || id == ASSET_ID { continue; }
+        let Some(d) = find_mod_dir(&id) else { continue };
+        let bp = format!(r"{}\BanPickIllust", d); if !std::path::Path::new(&bp).is_dir() { continue; }
+        let name = modinfo_name(&d).unwrap_or_else(|| id.clone());
+        if id == DEFAULT_ILLUST_PACK { baseline = Some((id, bp, name)); } else { sources.push((id, bp, name)); }
+    }
+    if let Some(b) = baseline { sources.push(b); }
+    // ★통합판(11-12): 단독판 캐시 `<게임>\mods\banpick_view_plus\illust\raw\<팩>` 에만 남은 팩(원본 모드가 지금 없는 팩 — 예 kahluamik_illust)도 소스로.
+    //   단독판은 raw 폴더 실제 내용으로 인덱스를 만들어(아래 「나머지(알파벳)」) 이런 팩을 계속 썼고, 이관된 splash.cfg 선택도 그 팩을 가리킨다.
+    //   위에서 이미 소스가 있는 팩·`_` 캐시·User_Splash_Art(유저 그림 루트에서 직접 읽음)는 제외. 순서·표시명 = 단독판의 「나머지」와 같게(알파벳 · 폴더 이름).
+    #[cfg(feature = "embedded")]
+    {
+        let legacy_raw = format!(r"{}\mods\{}\illust\raw", game, MOD_ID);
+        if let Ok(rd) = std::fs::read_dir(&legacy_raw) {
+            let mut extra: Vec<String> = rd.flatten().filter(|e| e.path().is_dir()).filter_map(|e| e.file_name().to_str().map(str::to_string))
+                .filter(|n| !n.starts_with('_') && n != PACK_USER && !sources.iter().any(|s| s.0 == *n)).collect();
+            extra.sort();
+            for n in extra { sources.push((n.clone(), format!(r"{}\{}", legacy_raw, n), n)); }
+        }
+    }
+    // 복사(새 파일/크기 변경만)
+    let mut copied = 0usize;
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new(); // (pack, 파일명) — 우선순위 높은 소스가 먼저 잡으면 뒤는 무시
+    for (pack, dir, _) in &sources {
+        let Ok(rd) = std::fs::read_dir(dir) else { continue };
+        let pd = format!(r"{}\{}", raw, pack); let _ = std::fs::create_dir_all(&pd);
+        for e in rd.flatten() {
+            let p = e.path(); if !p.is_file() { continue; }
+            let Some(name) = p.file_name().and_then(|s| s.to_str()) else { continue };
+            if !name.to_ascii_lowercase().ends_with(".png") || name.starts_with('_') || name.starts_with('.') { continue; }
+            if !seen.insert((pack.clone(), name.to_ascii_lowercase())) { continue; }
+            let dst = std::path::Path::new(&pd).join(name);
+            let need = match (p.metadata(), dst.metadata()) { (Ok(a), Ok(b)) => a.len() != b.len(), (Ok(_), Err(_)) => true, _ => false };
+            if need { if std::fs::copy(&p, &dst).is_ok() { copied += 1; } }
+        }
+    }
+    // 레드 오버라이드 stem = 캐시 실제 내용(팩과 같은 규칙)
+    let stems_of = |dir: String| -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                let p = e.path(); if !p.is_file() || !p.extension().map(|x| x.eq_ignore_ascii_case("png")).unwrap_or(false) { continue; }
+                if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) { out.insert(stem.to_string()); }
+            }
+        }
+        out
+    };
+    il.red = stems_of(format!(r"{}\_red", raw)); il.red_noflip = stems_of(format!(r"{}\_red_noflip", raw));
+    // 인덱스 = raw 폴더 실제 내용(복사 실패/기존 팩 포함). 팩 순서 = sources 순 + 나머지(알파벳)
+    let mut order: Vec<String> = Vec::new();
+    for s in &sources { if !s.0.starts_with('_') && !order.contains(&s.0) { order.push(s.0.clone()); } }
+    let mut names: HashMap<String, String> = sources.iter().map(|s| (s.0.clone(), s.2.clone())).collect();
+    if let Ok(rd) = std::fs::read_dir(&raw) {
+        let mut extra: Vec<String> = rd.flatten().filter(|e| e.path().is_dir()).filter_map(|e| e.file_name().to_str().map(str::to_string)).filter(|n| !n.starts_with('_') && !order.contains(n)).collect();
+        extra.sort();
+        for n in extra { names.entry(n.clone()).or_insert_with(|| n.clone()); order.push(n); }
+    }
+    for pack in &order {
+        let Ok(rd) = std::fs::read_dir(format!(r"{}\{}", raw, pack)) else { continue };
+        for e in rd.flatten() {
+            let p = e.path(); if !p.is_file() { continue; }
+            let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else { continue };
+            if !p.extension().map(|x| x.eq_ignore_ascii_case("png")).unwrap_or(false) { continue; }
+            let v = il.packs.entry(stem.to_string()).or_default(); if !v.contains(pack) { v.push(pack.clone()); }
+        }
+    }
+    let mut pack_layers: HashMap<String, BTreeSet<u32>> = HashMap::new();
+    for (stem, list) in &il.packs { if stem_base(stem) == "bg" { continue; } for p in list { pack_layers.entry(p.clone()).or_default().insert(stem_layer(stem)); } }
+    for p in &order { if let Some(ns) = pack_layers.get(p) { let nm = if p == PACK_USER { String::new() } else { names.get(p).cloned().unwrap_or_else(|| p.clone()) }; for n in ns { il.vpacks.push((p.clone(), nm.clone(), *n)); } } }
+    il.pack_order = order;
+    log(&format!("illust: packs={} stems={} vpacks={} copied={} red={}", il.pack_order.len(), il.packs.len(), il.vpacks.len(), copied, il.red.len() + il.red_noflip.len()));
+    il
+}
+fn illust() -> std::sync::Arc<Illust> { ILLUST.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(|| std::sync::Arc::new(prepare_illust())).clone() }
+fn layers_of(il: &Illust, base: &str) -> Vec<String> {
+    let mut v: Vec<(u32, String)> = il.packs.keys().filter(|s| stem_base(s) == base).map(|s| (stem_layer(s), s.clone())).collect();
+    v.sort(); v.into_iter().map(|x| x.1).collect()
+}
+fn flat_cands(il: &Illust, base: &str) -> Vec<String> {
+    let layers = layers_of(il, base); let mut out = Vec::new();
+    for pack in &il.pack_order { for stem in &layers { if il.packs.get(stem).map(|l| l.contains(pack)).unwrap_or(false) { out.push(format!("{}/{}", pack, stem)); } } }
+    out
+}
+fn chosen_key(il: &Illust, base: &str) -> Option<String> {
+    let c = flat_cands(il, base); if c.is_empty() { return None; }
+    let sel = splash_sel().get(base).cloned();
+    Some(match sel {
+        Some(k) if c.contains(&k) => k,
+        // 선택 없음 + 확대 ON = 첫 팩의 -1 그림(없으면 기본)
+        _ if cfg().zoom => { let p0 = c[0].split('/').next().unwrap_or(""); c.iter().find(|k| k.split_once('/').map(|(p, st)| p == p0 && stem_layer(st) == 1).unwrap_or(false)).cloned().unwrap_or_else(|| c[0].clone()) }
+        _ => c[0].clone(),
+    })
+}
+/// 팩 안에서 base 의 그림 stem 들 (layer, stem) — layer 오름차순
+fn pack_stems(il: &Illust, pack: &str, base: &str) -> Vec<(u32, String)> {
+    layers_of(il, base).into_iter().filter(|st| il.packs.get(st).map(|l| l.iter().any(|p| p == pack)).unwrap_or(false)).map(|st| (stem_layer(&st), st)).collect()
+}
+/// 풀다운 행 = (pack, 표시명, layer). layer None = 기본 행(확대 토글을 따름: ON → -1 · OFF → 기본 · 없으면 기본 그림 유지).
+///   -2 이상 그림이 있는 팩은 그 층을 별도 행 `(대체n)` 으로 둔다(확대 토글은 일반/-1 만 오간다 — Flover 요청 10-14).
+fn pack_rows(il: &Illust) -> Vec<(String, String, Option<u32>)> {
+    let mut out: Vec<(String, String, Option<u32>)> = Vec::new();
+    for (pack, name, n) in &il.vpacks {
+        if *n <= 1 { if !out.iter().any(|r| r.0 == *pack && r.2.is_none()) { out.push((pack.clone(), name.clone(), None)); } }
+        else { out.push((pack.clone(), name.clone(), Some(*n))); }
+    }
+    out
+}
+// ───────── 화면 문구(i18n · 11-11) ─────────
+/// 게임 언어 = custom_tier 방식: 게임 샘플 키에 한글이 있으면 ko, 빈 값이면 ko(현행 유지). 밴픽 진입·설정 패널이 열려 있는 동안 주기적으로 다시 본다.
+static LANG_KO: AtomicBool = AtomicBool::new(true);
+fn ko() -> bool { LANG_KO.load(Ordering::Relaxed) }
+fn is_hangul(c: char) -> bool { ('\u{ac00}'..='\u{d7a3}').contains(&c) || ('\u{1100}'..='\u{11ff}').contains(&c) || ('\u{3130}'..='\u{318f}').contains(&c) }
+fn refresh_lang(ctx: &StableClient<'_>) {
+    let sample = ctx.i18n("#asset/base/text/ui?main.champion_info.reset_tier").unwrap_or_default();
+    LANG_KO.store(sample.is_empty() || sample.chars().any(is_hangul), Ordering::Relaxed);
+}
+/// 소스 내장 한·영 표 = `text/bvp.i18n` 을 못 읽을 때(머지 실패·키 없음)의 폴백. ★ko 값은 bvp.i18n 의 ko 와 글자까지 같아야 한다.
+fn t_builtin(key: &str) -> &'static str {
+    let k = ko();
+    match key {
+        "pack_myart" => if k { "내 그림" } else { "My art" },
+        "pack_alt" => if k { "대체" } else { "alt" },
+        "pack_none" => if k { "적용 가능한 팩 없음" } else { "No packs available" },
+        "pack_select" => if k { "스플래시 아트 팩 선택..." } else { "Select pack..." },
+        _ => "",
+    }
+}
+/// 모드 문구 = `#asset/base/text/ui?banpick_view_plus.<key>`(bvp.i18n merge · 언어별 블록) → 못 읽으면 내장 표.
+fn tr(ctx: &StableClient<'_>, key: &str) -> String {
+    ctx.i18n(&format!("#asset/base/text/ui?banpick_view_plus.{}", key))
+        .filter(|s| !s.is_empty() && !s.starts_with('#') && !s.contains("banpick_view_plus."))
+        .unwrap_or_else(|| t_builtin(key).to_string())
+}
+/// 팩 버튼·풀다운 문구(설정 패널이 열려 있는 틱마다 읽는다).
+struct PackTxt { ko: bool, my_art: String, alt: String }
+/// 영어 화면용 팩 표시명: 표시명(= 다른 모드 mod_info `name`, 예 「밴픽 일러스트 (Ban/Pick Illust)」)의 앞부분에 한글이 있으면
+///   괄호 안 영문을, 그것도 한글이면 팩 id(폴더명)를 쓴다(영어 폰트엔 한글 글리프가 없어 □ 로 보인다).
+fn en_pack_name(id: &str, raw: &str) -> String {
+    let has_ko = |s: &str| s.chars().any(is_hangul);
+    let head = raw.split(" (").next().unwrap_or(raw).trim();
+    if !has_ko(head) { return head.to_string(); }
+    if let Some(i) = raw.find(" (") {
+        let inner = raw[i + 2..].split(')').next().unwrap_or("").trim();
+        if !inner.is_empty() && !has_ko(inner) { return inner.to_string(); }
+    }
+    id.to_string()
+}
+fn pack_row_label(row: &(String, String, Option<u32>), tx: &PackTxt) -> String {
+    let (id, raw, n) = row;
+    let base = if raw.is_empty() { tx.my_art.clone() } else if tx.ko { raw.split(" (").next().unwrap_or(raw).trim().to_string() } else { en_pack_name(id, raw) };
+    match n { Some(n) => format!("{} ({}{})", base, tx.alt, n), None => base }
+}
+fn apply_pack_row(il: &Illust, row: &(String, String, Option<u32>)) {
+    let (pack, _, n) = row;
+    let want = n.unwrap_or(if cfg().zoom { 1 } else { 0 });
+    let mut bases: BTreeSet<String> = BTreeSet::new();
+    for (stem, list) in &il.packs { if list.contains(pack) { let b = stem_base(stem); if b != "bg" { bases.insert(b); } } }
+    for base in bases {
+        let st = pack_stems(il, pack, &base);
+        // 원하는 층 → 없으면 기본(0) → 그래도 없으면 그 팩의 가장 낮은 층
+        let pick = st.iter().find(|(l, _)| *l == want).or_else(|| st.iter().find(|(l, _)| *l == 0)).or_else(|| st.first());
+        if let Some((_, stem)) = pick { set_splash(&base, &format!("{}/{}", pack, stem)); }
+    }
+}
+/// 확대 토글: 챔피언마다 지금 쓰는 팩 안에서 일반(0) ↔ 확대(-1) 로만 바꾼다. 그 팩에 -1 이 없으면 그대로(기본 그림 유지).
+fn apply_zoom(il: &Illust, on: bool) {
+    let mut bases: BTreeSet<String> = BTreeSet::new();
+    for stem in il.packs.keys() { let b = stem_base(stem); if b != "bg" { bases.insert(b); } }
+    let (from, to) = if on { (0, 1) } else { (1, 0) };
+    let mut n = 0usize;
+    for base in bases {
+        let Some(cur) = chosen_key(il, &base) else { continue };
+        let Some((pack, stem)) = cur.split_once('/') else { continue };
+        if stem_layer(stem) != from { continue; }
+        if let Some((_, st)) = pack_stems(il, pack, &base).into_iter().find(|(l, _)| *l == to) { set_splash(&base, &format!("{}/{}", pack, st)); n += 1; }
+    }
+    log(&format!("확대 {} — {}종 전환", if on { "ON" } else { "OFF" }, n));
+}
+/// 진영별 아트 = (에셋 경로, flip). 레드: red_noflip=0 → `illust\red\<stem>` / =1 → `illust\red_noflip\<stem>` 가 있으면 그것을 반전 없이,
+///   없으면 blue 그림을 엔진 flip(`red_noflip` 이면 안 뒤집음). (구 tfm2_banpick_illust 규칙)
+fn art_for(il: &Illust, key: &str, is_blue: bool) -> (String, bool) {
+    let noflip = cfg().red_noflip;
+    if !is_blue {
+        let stem = key.rsplit('/').next().unwrap_or(key);
+        let (set, dir) = if noflip { (&il.red_noflip, "red_noflip") } else { (&il.red, "red") };
+        if set.contains(stem) { return (format!("asset/{}/illust/raw/_{}/{}", ASSET_ID, dir, stem), false); }
+    }
+    (asset_of(key), !is_blue && !noflip)
+}
+/// 쇼케이스(연출 카드) 아트 — 픽 슬롯과 같은 선택(팩 순환 반영). 반환 = (에셋 경로, flip).
+pub(crate) fn showcase_art(champ_id: &str, is_blue: bool) -> Option<(String, bool)> {
+    let il = illust();
+    let k = chosen_key(&il, champ_id)?;
+    Some(art_for(&il, &k, is_blue))
+}
+fn cycle_illust(base: &str) {
+    let il = illust(); let c = flat_cands(&il, base); if c.len() < 2 { return; }
+    let cur = chosen_key(&il, base).unwrap_or_default();
+    let i = c.iter().position(|k| *k == cur).unwrap_or(0);
+    set_splash(base, &c[(i + 1) % c.len()]);
+}
+fn asset_of(key: &str) -> String { format!("asset/{}/illust/raw/{}", ASSET_ID, key) }
+
+/// ★09-20(유저 제보 "ㅎ 챔프 일부가 기본 창에서 안 뜸 — 안 보이는 부분에 가려진 듯"): 스페이서로 스크롤 범위를 늘리는 방식은
+///   마지막 줄이 하단 패널(y 745~985) 뒤에 남는 경우가 있어 폐기. 대신 **스크롤 뷰 높이 자체를 패널 위까지(640px)** 로 두고
+///   패널을 끄면 880px 로 되돌린다 — 가려질 영역이 아예 없다. 반환 = (패널 y, 스크롤 뷰 높이).
+fn layout_for(_card_area: f32, show: bool) -> (f32, f32) {
+    if !show { return (INFO_Y_OFF, VIEWPORT_H); }
+    (INFO_Y_ON, INFO_Y_ON - SCROLL_Y)
+}
+/// 스페이서 y = 콘텐츠 실제 끝 + 여백.
+/// ★0.6.1(09-22) 실측으로 확정한 게임측 관계식(debug.log f3301, 패널 ON·98챔프):
+///   `최대 스크롤 = 스페이서 바닥 − 뷰 높이 − SCROLL_SLACK`
+///   실측 = 스페이서 바닥 1858 · 뷰 640 → 최대 스크롤 **1198**(= 1858−640−20). 20px 은 scroll_view 의
+///   `bar_padding{top:10,bottom:10}` 몫으로 보인다. 그래서 여백을 16px 만 주면 **4px 이 모자라**
+///   마지막 줄 바닥(로컬 1842)이 클립 바닥(745)보다 4px 아래(749)에 놓여 **테두리가 잘린다**
+///   — 유저 제보 "살짝 잘린다"의 정체. 카드 rect·contents auto 높이 어느 쪽도 이 몫을 알려주지 않는다.
+///   ⟹ 여백 = SCROLL_SLACK(20) + 보이는 여백(20) = 40.
+///   여백이 과해도 손해는 아래쪽 빈 공간뿐이고(과거 +240 시 관측), 모자라면 곧바로 잘린다 ⟹ 넉넉한 쪽.
+fn spacer_y(card_area: f32, _view_h: f32) -> f32 {
+    if card_area <= 0.0 { return 0.0; }
+    CONTENTS_Y + card_area + SCROLL_SLACK + BOTTOM_GAP - SPACER_H
+}
+fn push_click(s: &str) { PENDING_CLICKS.lock().unwrap_or_else(|e| e.into_inner()).push(s.to_string()); }
+fn name_map(ctx: &StableClient<'_>) -> HashMap<String, String> {
+    let mut g = NAME_MAP.lock().unwrap_or_else(|e| e.into_inner());
+    g.get_or_insert_with(|| { let mut m = HashMap::new(); for id in ctx.champion_names() { if let Some(n) = ctx.i18n(&format!("#asset/base/text/champion?description.{}.name", id)) { if !n.is_empty() { m.insert(n, id.clone()); } } } log(&format!("이름 맵 {}개", m.len())); m }).clone()
+}
+/// ★09-23: 0.6.x 게임은 픽 카드의 `name`/`position`/`proficiency_top` 을 **매 프레임 자기 좌표로 되돌린다**
+///   (.ui 로 옮겨도 무효 — 실측: 게임이 안 건드리는 `proficiency_badge_title`/`badge` 만 .ui 값이 살아남았다).
+///   ⟹ 하단 띠 배치는 여기서 **매 프레임** 강제한다. 모드 본체는 3프레임 주기라 거기서 고치면
+///   2/3 프레임은 게임 위치로 보여 **깜빡인다**(유저 제보 09-23).
+///   비용 절감 = 슬롯0의 이름 rect 만 먼저 보고(프로브), 이미 맞으면 나머지는 건드리지 않는다.
+///   대기·차례 슬롯("?" 일러)도 같은 배치 — 정보가 "?" 위로 올라온다.
+///   ★11-04: 블루 `name` 은 x 만이 아니라 정렬까지 여기서 쓴다 — 주장 배지 보정(아래 BLUE_NAME)이 정한 값을 매 프레임 그대로.
+///   ~~x 194 고정~~: 보정이 3프레임 주기로 1회만 쓰고 캐시로 건너뛰는데 이 함수가 x 를 194 로 되돌렸고, 세트가 바뀌어 게임이
+///   이름 라벨을 새로 만들면 정렬도 .ui 의 Right 로 돌아가 캐시와 어긋났다 → 「Show...」 끝 글자에 C 가 겹침(유저 제보 사진, 0.7.0).
+const CARD_POS_BLUE: [(&str, f32, f32); 3] = [("name", 194.0, 137.0), ("position", 268.0, 117.0), ("proficiency_top", 10.0, 140.0)];
+const CARD_POS_RED: [(&str, f32, f32); 3] = [("name", 10.0, 137.0), ("position", 10.0, 117.0), ("proficiency_top", 166.0, 140.0)];
+/// ★11-04(0.7.0 신규 스타일): 게임이 픽 완료 카드의 「숙련도 보너스」 제목·알약을 **매 프레임** 일러 위쪽(제목 y≈33·알약 y≈58)으로 옮긴다
+///   (기존 스타일은 .ui 값이 그대로 산다 — 10-29 실측). 일러 얼굴을 가린다는 유저 제보 → 하단 반투명 판 윗줄(y 114~138,
+///   숙련 챔피언 얼굴 `proficiency_top` 바로 위 · 포지션 아이콘 반대쪽)에 고정한다. 이름·얼굴과 안 겹친다.
+///   신규 다크 실측(11-04 진단 rect): 게임이 제목 폭을 136 으로 늘려 가운데 정렬(글자 ≈102px) · 알약 60×24.
+///   ⟹ 제목은 왼쪽 정렬 + fit_width(폭 = 글자폭)로 바꾸고, 3프레임 패스에서 실제 폭을 재서 알약을 바로 뒤에 둔다(언어 무관).
+///   블루 = 왼쪽(얼굴 위)부터 [제목][알약] · 레드 = 오른쪽 끝(280)에 맞춰 [제목][알약]. 아래 값은 첫 측정 전 기본값(한국어 기준).
+const PROF_Y: i32 = 116;
+const PROF_GAP: f32 = 6.0;
+const PROF_BLUE_X0: f32 = 18.0;
+const PROF_RED_X1: f32 = 280.0;
+const PROF_DEFAULT_BLUE: (f32, f32) = (18.0, 126.0);
+const PROF_DEFAULT_RED: (f32, f32) = (110.0, 218.0);
+const BLUE_NAME_DEFAULT: &str = "align_x: Right; x: 194px;";
+fn card_block(ctx: &StableClient<'_>, slot: &str) -> Option<String> {
+    for b in ["done", "in_turn", "wait"] {
+        let p = format!("{}.{}", slot, b);
+        if ctx.ui_visible(&p) == Some(true) { return Some(p); }
+    }
+    None
+}
+fn fix_card_labels(ctx: &mut StableClient<'_>) {
+    // ★x/y 는 **무조건 매 프레임** 덮어쓴다. rect 를 보고 "어긋났을 때만" 고치면, 우리가 고친 프레임엔
+    //   맞다고 읽혀 건너뛰고 → 그 사이 게임이 되돌려 → 격프레임으로 왔다갔다 = 깜빡임(유저 제보 2회).
+    let names = BLUE_NAME.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default();
+    let prof = PROF_X.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default();
+    for team in ["blue", "red"] {
+        let blue = team == "blue";
+        let want = if blue { CARD_POS_BLUE } else { CARD_POS_RED };
+        for n in 0..5 {
+            let slot = format!("main.{}_picks.pick_slot_{}", team, n);
+            let Some(blk) = card_block(ctx, &slot) else { continue };
+            for (nm, wx, wy) in want {
+                let p = format!("{}.{}", blk, nm);
+                if blue && nm == "name" {
+                    let ax = names.get(&p).map(|(_, w)| w.as_str()).unwrap_or(BLUE_NAME_DEFAULT);
+                    ctx.ui_set_properties(&p, &format!("{} y: {}px; z: 310;", ax, wy as i32));
+                } else {
+                    ctx.ui_set_properties(&p, &format!("x: {}px; y: {}px; z: 310;", wx as i32, wy as i32));
+                }
+            }
+            if blk.ends_with(".done") && NEW_UI.load(Ordering::Relaxed) {
+                let (tx, bx) = prof.get(&blk).copied().unwrap_or(if blue { PROF_DEFAULT_BLUE } else { PROF_DEFAULT_RED });
+                ctx.ui_set_properties(&format!("{}.proficiency_badge_title", blk), &format!("anchor_x: 0; pivot_x: 0; anchor_y: 0; pivot_y: 0; align_x: Left; fit_width: true; x: {}px; y: {}px; z: 310;", tx as i32, PROF_Y));
+                ctx.ui_set_properties(&format!("{}.proficiency_badge", blk), &format!("anchor_x: 0; pivot_x: 0; anchor_y: 0; pivot_y: 0; x: {}px; y: {}px; z: 310;", bx as i32, PROF_Y));
+            }
+        }
+    }
+}
+
+/// 숙련도 위젯은 **빈 컨테이너**(`:empty`)라 z 가 자식에게 안 내려간다 — 컨테이너만 z310 을 줘도
+/// 배경·아이콘·라벨(자식)은 z0 으로 남아 **일러(z300) 밑에 깔린다**(유저 제보: % 와 챔피언 얼굴이 아예 안 보임).
+/// z 는 게임이 되돌리지 않으므로(`.ui` 의 title z310 이 유지되는 것으로 실측) 3프레임 주기 패스에서 1회씩만 올린다.
+fn raise_card_children(ctx: &mut StableClient<'_>) {
+    for team in ["blue", "red"] {
+        for n in 0..5 {
+            let slot = format!("main.{}_picks.pick_slot_{}", team, n);
+            let Some(blk) = card_block(ctx, &slot) else { continue };
+            for cont in ["proficiency_top", "proficiency_badge", "proficiency_badge_title"] {
+                let cp = format!("{}.{}", blk, cont);
+                if !ctx.ui_exists(&cp) { continue; }
+                ctx.ui_set_properties(&cp, "z: 310;");
+                for k in ctx.ui_child_names(&cp) {
+                    let kp = format!("{}.{}", cp, k);
+                    ctx.ui_set_properties(&kp, "z: 311;");
+                    for k2 in ctx.ui_child_names(&kp) { ctx.ui_set_properties(&format!("{}.{}", kp, k2), "z: 312;"); }
+                }
+            }
+        }
+    }
+}
+
+fn set_vis(ctx: &mut StableClient<'_>, p: &str, v: bool) { if ctx.ui_exists(p) && ctx.ui_visible(p) != Some(v) { ctx.ui_set_visible(p, v); } }
+
+struct Ext;
+impl StableExtension for Ext {
+    fn post_update(&self, ctx: &mut StableClient<'_>, _dt: u64) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let f = FRAME.fetch_add(1, Ordering::Relaxed);
+            // 카드 라벨 위치 보정만 매 프레임(위 주석 참조 — 3프레임 주기면 깜빡인다)
+            if ACTIVE.load(Ordering::Relaxed) { fix_card_labels(ctx); }
+            if f % 3 != 0 { return; }
+            if cfg().showcase { showcase::tick(); } // 늦은 1회 설치(멱등) — 밴픽 화면 진입 전에 설치돼 있어야 첫 연출부터 잡힌다
+            if !ctx.ui_exists(DISC) { deactivate(); return; }
+            let il = illust();
+            if !ACTIVE.swap(true, Ordering::Relaxed) {
+                DIAG.store(mod_dir().map(|d| std::path::Path::new(&format!(r"{}\bp_diag.flag", d)).exists()).unwrap_or(false), Ordering::Relaxed);
+                log("밴픽 화면 활성");
+                refresh_lang(ctx); // ★11-11 i18n: 밴픽 진입마다 게임 언어 재판정
+                *AXES.lock().unwrap_or_else(|e| e.into_inner()) = Some(compute_axes(ctx));
+                *NAME_COLOR.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                *LAST_LAYOUT.lock().unwrap_or_else(|e| e.into_inner()) = (-1.0, -1.0);
+                *LAST_BG.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                *LAST_SPLASH.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                *BLUE_NAME.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                *PROF_X.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                NEW_UI.store(read_new_ui_style(), Ordering::Relaxed);
+                log(&format!("UI 스타일 신규={}", NEW_UI.load(Ordering::Relaxed)));
+                DIM_STATE.store(false, Ordering::Relaxed);
+                // 스킨 관련 버튼은 이 판에서 제외 → 숨김
+                for p in [format!("{}.bp_skin_pack_cycle", PANEL)] { set_vis(ctx, &p, false); }
+            }
+            // ── 클릭 등록(밴픽 진입마다 1회 — ★10-14: 씬 재생성 시 등록 소실 실측 · ~~프로세스당 1회, 경로 키 영구~~)
+            if !CLICKS_REGISTERED.swap(true, Ordering::Relaxed) {
+                ctx.ui_register_click(DISC, "", |_| push_click("settings"));
+                for k in ["bp_panel_toggle", "bp_namecolor_toggle", "bp_redflip_toggle", "bp_hoverbg_toggle", "bp_follow_toggle", "bp_bg_cycle", "bp_pack_cycle", "bp_zoom_toggle"] {
+                    let kk: &'static str = k;
+                    ctx.ui_register_click(&format!("{}.{}", PANEL, k), "", move |_| push_click(kk));
+                }
+                for team in ["blue", "red"] { for n in 0..5 { let tag: String = format!("illust:{}:{}", team, n); let p = format!("main.{}_picks.pick_slot_{}.done.bp_illust_cycle", team, n); let t2 = tag.clone(); ctx.ui_register_click(&p, "", move |_| push_click(&t2)); let _ = tag; } }
+                log("클릭 핸들러 등록");
+                // ★10-14 진단 v2: ⚙ 자리 클릭을 누가 받는지 — 후보 노드마다 경로 이벤트 리스너(클릭류)
+                if DIAG.load(Ordering::Relaxed) {
+                    let roots = ctx.ui_child_names("");
+                    log(&format!("diag 루트 노드 = {:?} · main 자식 = {:?}", roots, ctx.ui_child_names(ROOT)));
+                    let cands = ["main", "main.header", "main.header.next_turn", "main.header.step", "main.header.bp_settings", "main.header.bp_settings.icon", "main.phase_indicator", "main.phase_indicator.text", "main.coach_delegation_indicator", "main.coach_dialogue_toast", "main.coach_dialogue_button_tooltip", "main.tooltip", "main.background", "main.bp_hover_bg", "main.champion_pool_wait_overlay"];
+                    let mut regd = Vec::new();
+                    for p in cands { let pp: &'static str = p; if ctx.ui_register_path_events(pp, move |c| { if let Some(e) = c.ui_current_event() { log(&format!("diag 이벤트 [{}] kind={:?} path={} payload={}", pp, e.kind, e.path, e.payload_json)); } }) { regd.push(pp); } }
+                    log(&format!("diag 리스너 등록 {:?}", regd));
+                }
+            }
+            if let Some(msg) = draft_scene::install_once() { log(&msg); }
+            draft_scene::tick();
+            // ── 스왑 표 행 클릭 등록(스왑 화면 진입마다 — 표는 매 스왑 재스폰되므로 경로 등록이 남아 있어도 다시 건다; 같은 프레임 중복은 처리부에서 무시)
+            {
+                let swap_vis = ctx.ui_visible("main.swap").unwrap_or(false);
+                if swap_vis && !SWAP_ACTIVE.swap(true, Ordering::Relaxed) {
+                    let mut ok = 0;
+                    for team in ["blue", "red"] { for n in 0..5 { let tag: String = format!("swap:{}:{}", team, n); let p = format!("main.swap.{}_table.swap_slot_{}", team, n); if ctx.ui_exists(&p) { let t2 = tag.clone(); if ctx.ui_register_click(&p, "", move |_| push_click(&t2)) { ok += 1; } } } }
+                    *SWAP_SEL.lock().unwrap_or_else(|e| e.into_inner()) = [None, None];
+                    log(&format!("스왑 화면 진입: 행 클릭 등록 {}/10", ok));
+                } else if !swap_vis && SWAP_ACTIVE.swap(false, Ordering::Relaxed) {
+                    *SWAP_SEL.lock().unwrap_or_else(|e| e.into_inner()) = [None, None];
+                }
+            }
+            // ── 클릭 처리
+            let clicks_raw: Vec<String> = std::mem::take(&mut *PENDING_CLICKS.lock().unwrap_or_else(|e| e.into_inner()));
+            // ★10-14: 같은 처리 묶음(3프레임) 안 같은 클릭 태그는 1회만 — 한 번 누른 클릭이 두 번 전달되면 토글(⚙ 열기)이 열림→닫힘으로 상쇄된다(레드 ⚙ 클릭 불가 가설).
+            if !clicks_raw.is_empty() { log(&format!("클릭 묶음 raw={:?} settings_open={}", clicks_raw, SETTINGS_OPEN.load(Ordering::Relaxed))); }
+            let mut seen_click: BTreeSet<String> = BTreeSet::new();
+            let clicks: Vec<String> = clicks_raw.into_iter().filter(|c| seen_click.insert(c.clone())).collect();
+            if DIAG.load(Ordering::Relaxed) && f % 60 == 0 { diag_hit(ctx); }
+            for c in clicks {
+                match c.as_str() {
+                    "settings" => { let v = !SETTINGS_OPEN.load(Ordering::Relaxed); SETTINGS_OPEN.store(v, Ordering::Relaxed); if !v { PACK_LIST_OPEN.store(false, Ordering::Relaxed); } }
+                    "bp_panel_toggle" => cfg_mut(|c| c.show_panel = !c.show_panel),
+                    "bp_namecolor_toggle" => cfg_mut(|c| c.name_color = !c.name_color),
+                    "bp_redflip_toggle" => cfg_mut(|c| c.red_noflip = !c.red_noflip),
+                    "bp_hoverbg_toggle" => cfg_mut(|c| c.show_bg = !c.show_bg),
+                    "bp_follow_toggle" => cfg_mut(|c| c.hero_bg = !c.hero_bg),
+                    "bp_bg_cycle" => cycle_illust("bg"),
+                    "bp_pack_cycle" => { if !pack_rows(&il).is_empty() { let v = !PACK_LIST_OPEN.load(Ordering::Relaxed); PACK_LIST_OPEN.store(v, Ordering::Relaxed); } }
+                    "bp_zoom_toggle" => { cfg_mut(|c| c.zoom = !c.zoom); apply_zoom(&il, cfg().zoom); }
+                    s if s.starts_with("packrow:") => {
+                        let rows = pack_rows(&il);
+                        if let Some(i) = s["packrow:".len()..].parse::<usize>().ok().filter(|i| *i < rows.len()) { *STAGED.lock().unwrap_or_else(|e| e.into_inner()) = Some(i); apply_pack_row(&il, &rows[i]); }
+                        PACK_LIST_OPEN.store(false, Ordering::Relaxed);
+                    }
+                    s if s.starts_with("illust:") => {
+                        let parts: Vec<&str> = s.split(':').collect();
+                        if parts.len() == 3 { let is_blue = parts[1] == "blue"; if let Ok(n) = parts[2].parse::<usize>() { if let Some(id) = SLOT_CHAMP.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&(is_blue, n)).cloned()) { cycle_illust(&id); } } }
+                    }
+                    s if s.starts_with("swap:") => {
+                        // 같은 프레임 중복 발화(재등록 누적) 무시
+                        { let mut lc = SWAP_LAST_CLICK.lock().unwrap_or_else(|e| e.into_inner()); if lc.as_ref().map(|(ff, t)| *ff == f && t == s).unwrap_or(false) { continue; } *lc = Some((f, s.to_string())); }
+                        let parts: Vec<&str> = s.split(':').collect();
+                        if parts.len() == 3 { if let Ok(n) = parts[2].parse::<usize>() {
+                            let is_blue = parts[1] == "blue"; let si = if is_blue { 0 } else { 1 };
+                            let mut sel = SWAP_SEL.lock().unwrap_or_else(|e| e.into_inner());
+                            match sel[si] {
+                                Some(a) if a == n => { sel[si] = None; }
+                                Some(a) => {
+                                    sel[si] = None;
+                                    let team = parts[1];
+                                    let mut order: Vec<(usize, f32)> = (0..5).filter_map(|k| ctx.ui_node_rect(&format!("main.{}_picks.pick_slot_{}", team, k)).map(|r| (k, r.1))).collect();
+                                    order.sort_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal));
+                                    if let (Some(&(ka, _)), Some(&(kb, _))) = (order.get(a), order.get(n)) {
+                                        let mut g = PICK_STATE.lock().unwrap_or_else(|e| e.into_inner());
+                                        if let Some(st) = g.as_mut() {
+                                            let va = st.slot_champ.get(&(is_blue, ka)).cloned(); let vb = st.slot_champ.get(&(is_blue, kb)).cloned();
+                                            match (va, vb) { (Some(va), Some(vb)) => { st.slot_champ.insert((is_blue, ka), vb.clone()); st.slot_champ.insert((is_blue, kb), va.clone()); log(&format!("스왑 추적 {}: 행{}↔행{} = 슬롯{}({})↔슬롯{}({})", team, a, n, ka, va, kb, vb)); } _ => log(&format!("스왑 추적 {}: 슬롯 {}/{} 챔피언 미확정 — 건너뜀", team, ka, kb)) }
+                                        }
+                                    }
+                                }
+                                None => { sel[si] = Some(n); }
+                            }
+                        } }
+                    }
+                    _ => {}
+                }
+                log(&format!("클릭 {}", c));
+            }
+            let c = cfg();
+            // ── 크롬(카테고리 드롭다운이 보일 때만 필터·⚙)
+            let chrome = ctx.ui_visible("main.champion_category").unwrap_or(true);
+            set_vis(ctx, "main.champion_tier_filter", chrome);
+            set_vis(ctx, DISC, chrome);
+            // ── 설정 패널
+            let panel_open = chrome && SETTINGS_OPEN.load(Ordering::Relaxed);
+            set_vis(ctx, PANEL, panel_open);
+            if !panel_open { PACK_LIST_OPEN.store(false, Ordering::Relaxed); }
+            if panel_open {
+                for (btn, on) in [("bp_panel_toggle", c.show_panel), ("bp_namecolor_toggle", c.name_color), ("bp_redflip_toggle", c.red_noflip), ("bp_hoverbg_toggle", c.show_bg), ("bp_follow_toggle", c.show_bg && c.hero_bg), ("bp_zoom_toggle", c.zoom)] {
+                    set_vis(ctx, &format!("{}.{}.on", PANEL, btn), on); set_vis(ctx, &format!("{}.{}.off", PANEL, btn), !on);
+                }
+                let bg_cands = flat_cands(&il, "bg").len();
+                // ★11-11 i18n: ~~패널 제목에 「환경설정」이 있으면 ko~~ → 공통 언어 판정(LANG_KO) + bvp.i18n 키. 패널이 열려 있는 동안 1초마다 언어 재확인.
+                if f % 60 == 0 { refresh_lang(ctx); }
+                let tx = PackTxt { ko: ko(), my_art: tr(ctx, "pack_myart"), alt: tr(ctx, "pack_alt") };
+                let bg_label = if bg_cands == 0 { "0".to_string() } else { let cur = chosen_key(&il, "bg"); let c = flat_cands(&il, "bg"); let pos = cur.as_deref().and_then(|k| c.iter().position(|x| x == k)).unwrap_or(0); format!("{}/{}", pos + 1, c.len()) };
+                ctx.ui_set_text(&format!("{}.bp_bg_cycle.idx", PANEL), &bg_label);
+                let staged = *STAGED.lock().unwrap_or_else(|e| e.into_inner());
+                let rows = pack_rows(&il);
+                let pack_label = match staged {
+                    Some(i) => rows.get(i).map(|r| pack_row_label(r, &tx)).unwrap_or_default(),
+                    None if rows.is_empty() => tr(ctx, "pack_none"),
+                    None => tr(ctx, "pack_select"),
+                };
+                ctx.ui_set_text(&format!("{}.bp_pack_cycle.label", PANEL), &pack_label);
+                set_vis(ctx, &format!("{}.skin_pack_caption", PANEL), false);
+                set_vis(ctx, &format!("{}.bp_skin_pack_cycle", PANEL), false);
+                for (btn, dis) in [("bp_follow_toggle", !c.show_bg), ("bp_bg_cycle", !(c.show_bg && bg_cands >= 2)), ("bp_pack_cycle", rows.len() < 2)] { ctx.ui_set_properties(&format!("{}.{}", PANEL, btn), &format!("disabled: {};", dis)); }
+                draw_pack_list(ctx, &rows, staged, &tx);
+            }
+            // ── 픽 슬롯 챔피언: done.name 은 **선수 이름**이라 못 쓴다(0.6.0 실측). 카드 그리드의 `blue`/`red` 오버레이(픽 표시)가 새로 켜진
+            //    챔피언과 새로 `done` 이 된 슬롯을 같은 틱에서 짝지운다(픽 순서 = 슬롯 완료 순서). 늦게 켠 경우엔 남은 것끼리 순서대로.
+            let mut slots: HashMap<(bool, usize), String> = HashMap::new();
+            let mut slot_rects: Vec<((bool, usize), (f32, f32, f32, f32))> = Vec::new();
+            let mut done_now: Vec<(bool, usize)> = Vec::new();
+            for team in ["blue", "red"] {
+                let is_blue = team == "blue";
+                for n in 0..5 {
+                    let slot = format!("main.{}_picks.pick_slot_{}", team, n);
+                    if let Some(r) = ctx.ui_node_rect(&slot) { slot_rects.push(((is_blue, n), r)); }
+                    if ctx.ui_visible(&format!("{}.done", slot)).unwrap_or(false) { done_now.push((is_blue, n)); }
+                    else { slots.insert((is_blue, n), if is_blue { "question_blue".into() } else { "question_red".into() }); }
+                }
+            }
+            let cards: Vec<String> = cards_cached(ctx, f);
+            let flagged: Vec<(bool, String)> = {
+                let mut fc = FLAG_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+                let mut done_sorted = done_now.clone(); done_sorted.sort();
+                if fc.0 != done_sorted { fc.0 = done_sorted; fc.1 = f; }
+                if f.saturating_sub(fc.1) <= 15 || f % 60 == 0 {
+                    let mut fl: Vec<(bool, String)> = Vec::new();
+                    for id in &cards {
+                        if ctx.ui_visible(&format!("{}.{}.blue", CARDS, id)) == Some(true) { fl.push((true, id.clone())); }
+                        if ctx.ui_visible(&format!("{}.{}.red", CARDS, id)) == Some(true) { fl.push((false, id.clone())); }
+                    }
+                    fc.2 = fl;
+                }
+                fc.2.clone()
+            };
+            {
+                let mut g = PICK_STATE.lock().unwrap_or_else(|e| e.into_inner());
+                let st = g.get_or_insert_with(PickState::default);
+                // 사라진 것 정리(새 세트 등)
+                st.slot_champ.retain(|k, _| done_now.contains(k));
+                st.known.retain(|k| flagged.contains(k));
+                for side in [true, false] {
+                    let mut new_champs: Vec<String> = flagged.iter().filter(|(b, id)| *b == side && !st.known.contains(&(side, id.clone())) && !st.slot_champ.values().any(|v| v == id)).map(|(_, id)| id.clone()).collect();
+                    let mut new_slots: Vec<(bool, usize)> = done_now.iter().filter(|k| k.0 == side && !st.slot_champ.contains_key(k)).copied().collect();
+                    new_slots.sort();
+                    for (k, id) in new_slots.iter().zip(new_champs.drain(..)) { st.slot_champ.insert(*k, id.clone()); st.known.push((side, id)); log(&format!("슬롯 매칭 {:?} ← {}", k, st.slot_champ[k])); }
+                }
+                // ★09-18 RE: 스왑 단계(phase 7)부터는 씬 raw order(포지션 p → 픽 인덱스)가 정답 — 유저 클릭·코치 위임·상대 AI 스왑 전부 반영.
+                //   y 순 p 번째 픽 슬롯 ← pick[order[p]]. raw 를 못 읽으면(훅 미설치) 클릭 추적(swap:) 결과가 남는다.
+                if let Some(raw) = draft_scene::read().filter(|r| r.phase >= draft_scene::PHASE_SWAP) {
+                    for side in [true, false] {
+                        let lineup = raw.lineup(if side { 0 } else { 1 });
+                        if lineup.is_empty() { continue; }
+                        let mut order: Vec<(usize, f32)> = slot_rects.iter().filter(|((b, _), _)| *b == side).map(|((_, n), r)| (*n, r.1)).collect();
+                        order.sort_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal));
+                        for (p, c) in lineup.iter().enumerate() {
+                            if let (Some(c), Some(&(n, _))) = (c, order.get(p)) {
+                                if st.slot_champ.contains_key(&(side, n)) && st.slot_champ.get(&(side, n)) != Some(c) { log(&format!("스왑 raw: {} 슬롯{} {} → {}", if side { "blue" } else { "red" }, n, st.slot_champ[&(side, n)], c)); }
+                                if st.slot_champ.contains_key(&(side, n)) { st.slot_champ.insert((side, n), c.clone()); }
+                            }
+                        }
+                    }
+                    if f % 600 == 0 { log(&format!("스왑 raw: phase={} orderA={:?} orderB={:?}", raw.phase, raw.order_a, raw.order_b)); }
+                }
+                for (k, v) in &st.slot_champ { slots.insert(*k, v.clone()); }
+                if f % 600 == 0 { log(&format!("flagged={:?} done={:?} slots={:?}", flagged, done_now, st.slot_champ)); }
+            }
+            *SLOT_CHAMP.lock().unwrap_or_else(|e| e.into_inner()) = Some(slots.clone());
+            // ── 스왑 확정 전 상대 진영 가림(★0.6.1 09-23 요청 · 아래 「픽 슬롯 스플래시」 주석)
+            //   ★10-21(Flover "스왑 완료 후에도 계속 ? → 전술창"): main.swap 은 **phase 8~9(양쪽 확정 후)에도 계속 떠 있다**(debug.log 10-14: phase 7→8→9 동안
+            //     swap 가시 · 상대 raw 순서는 7→8 사이에 바뀜) ⟹ 가시만 보면 결과를 못 보고 전술창으로 넘어간다. phase < PHASE_REVEAL 일 때만 가린다.
+            //   slots 자체를 덮는다 — 호버 배경도 slots 를 읽어서, 덮지 않으면 가린 슬롯에 호버 시 상대 실제 배치가 배경으로 샌다.
+            let hide_side: Option<bool> = if ctx.ui_visible("main.swap").unwrap_or(false) {
+                draft_scene::read().filter(|r| r.phase < PHASE_REVEAL).and_then(|r| {
+                    let me = ctx.player_team_id()? as u64;
+                    if me == r.t1_id { Some(false) } else if me == r.t2_id { Some(true) } else { None }  // 숨길 쪽 = 상대
+                })
+            } else { None };
+            if let Some(hs) = hide_side {
+                for ((b, _), v) in slots.iter_mut() { if *b == hs { *v = if hs { "question_blue".into() } else { "question_red".into() }; } }
+            }
+            // ── 호버(커서 → 카드/슬롯)
+            let cur = cursor_ui();
+            let mut hov: Option<(String, (f32, f32, f32, f32))> = None;
+            if let Some(p) = cur {
+                if ctx.ui_visible("main.champions").unwrap_or(false) {
+                    let clip = ctx.ui_node_rect("main.champions").unwrap_or((335.0, 105.0, 1250.0, 880.0));
+                    if inside(clip, p) {
+                        // rect 캐시: 첫 카드 rect(스크롤 지표)가 같으면 캐시 사용, 다르면 전체 재측정
+                        let first = cards.first().and_then(|id| ctx.ui_node_rect(&format!("{}.{}", CARDS, id)));
+                        let mut rc = RECT_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+                        let stale = match (&*rc, first) { (Some((fr, _)), Some(cur)) => *fr != cur, _ => true };
+                        if stale {
+                            let mut v = Vec::with_capacity(cards.len());
+                            for id in &cards { let cp = format!("{}.{}", CARDS, id); if let Some(r) = ctx.ui_node_rect(&cp) { v.push((id.clone(), r)); } }
+                            *rc = first.map(|fr| (fr, v));
+                        }
+                        if let Some((_, v)) = rc.as_ref() {
+                            if let Some((id, r)) = v.iter().find(|(_, r)| inside(*r, p)) {
+                                let cp = format!("{}.{}", CARDS, id);
+                                if ctx.ui_visible(&cp) == Some(true) { hov = Some((id.clone(), *r)); }
+                            }
+                        }
+                    }
+                }
+                if hov.is_none() { for (k, r) in &slot_rects { if inside(*r, p) { if let Some(id) = slots.get(k) { if !id.starts_with("question") { hov = Some((id.clone(), *r)); } } } } }
+            }
+            *HOVER.lock().unwrap_or_else(|e| e.into_inner()) = hov.clone();
+
+            // ── 배경
+            // ★호버 배경은 **호버 중일 때만**(2026-09-17: 마지막 호버가 끈적하게 남아 "일러스트가 배경에 남는" 제보) — 카드/슬롯 호버가 끝나면 즉시 bg 팩(또는 없음)으로.
+            *HOVER_BG_KEY.lock().unwrap_or_else(|e| e.into_inner()) = match &hov { Some((id, _)) if c.show_bg && c.hero_bg => chosen_key(&il, id), _ => None };
+            let bg_key: Option<String> = if !c.show_bg { None } else if c.hero_bg { HOVER_BG_KEY.lock().unwrap_or_else(|e| e.into_inner()).clone().or_else(|| chosen_key(&il, "bg")) } else { chosen_key(&il, "bg") };
+            {
+                let mut last = LAST_BG.lock().unwrap_or_else(|e| e.into_inner());
+                if *last != bg_key {
+                    match &bg_key {
+                        Some(k) => { let h = 1920.0 * ILLUST_ASPECT; ctx.ui_set_properties(HOVER_BG, &format!("source: \"{}\"; x: 0px; y: {}px; width: 1920px; height: {}px; color: #ffffff80;", asset_of(k), ((1080.0 - h) / 2.0) as i32, h as i32)); set_vis(ctx, HOVER_BG, true); }
+                        None => set_vis(ctx, HOVER_BG, false),
+                    }
+                    *last = bg_key.clone();
+                }
+            }
+            let dim = bg_key.is_some();
+            if DIM_STATE.load(Ordering::Relaxed) != dim { for (p, orig, dimc) in DIM_NODES { if ctx.ui_exists(p) { ctx.ui_set_properties(p, &format!("color: {};", if dim { dimc } else { orig })); } } DIM_STATE.store(dim, Ordering::Relaxed); }
+            // ── 픽 슬롯 스플래시 + 순환 버튼
+            // ★0.6.1(09-22 요청 → 09-23 정정): **스왑 화면이 떠 있는 동안 상대 진영 일러를 "?" 로 둔다.**
+            //   요청 원문 = "밴픽 완료 → 내 스왑 정하기 → 스왑 확정" 에서, 내가 정하는 동안 상대는 아직 확정 전이므로
+            //   상대 배치를 보여주면 안 된다. 스왑 화면이 닫히면(= 양쪽 확정) 원래 일러로 돌아온다.
+            //   ⚠구현 1차(09-22)는 `sent!=0`(내 SwapDone, 씬 0x466)을 걸었는데 ①의미가 요청과 다르고
+            //     ②실측상 확정을 눌러도 계속 0 이었다(0.6.1 로그: phase 5→7 정상, sent 내내 0) ⟹ 조건에서 제거.
+            //   내 진영 = player_team_id ↔ t1_id(블루)/t2_id(레드). 못 가리면 **아무것도 안 한다**(폴백).
+            //   hide_side 계산·slots 덮기 = 위 호버 앞(10-21 이동 · 확정 후 공개).
+            if DBG && !CARD_DUMPED.swap(true, Ordering::Relaxed) {
+                for slot in ["main.blue_picks.pick_slot_0", "main.blue_picks.pick_slot_1"] {
+                    for b in ["done", "in_turn", "wait"] {
+                        let bp = format!("{}.{}", slot, b);
+                        if ctx.ui_visible(&bp) != Some(true) { continue; }
+                        let mut v: Vec<String> = Vec::new();
+                        for c in ctx.ui_child_names(&bp) {
+                            let cp = format!("{}.{}", bp, c);
+                            v.push(format!("{}={:?} vis={:?} kids={}", c, ctx.ui_node_rect(&cp), ctx.ui_visible(&cp), ctx.ui_child_names(&cp).len()));
+                        }
+                        log(&format!("카드덤프 {} [{}]: {}", slot, b, v.join(" | ")));
+                    }
+                }
+            }
+            if DBG && ctx.ui_visible("main.swap").unwrap_or(false) && !BOTTOM_DUMPED.swap(true, Ordering::Relaxed) {
+                let mut out: Vec<String> = Vec::new();
+                let mut walk = |ctx: &StableClient<'_>, root: &str, out: &mut Vec<String>| {
+                    for a in ctx.ui_child_names(root) {
+                        let pa = format!("{}.{}", root, a);
+                        if let Some(r) = ctx.ui_node_rect(&pa) { if r.1 + r.3 > 950.0 || r.1 > 950.0 { out.push(format!("{}={:?}", pa, r)); } }
+                        for b in ctx.ui_child_names(&pa) {
+                            let pb = format!("{}.{}", pa, b);
+                            if let Some(r) = ctx.ui_node_rect(&pb) { if r.1 > 950.0 { out.push(format!("{}={:?} vis={:?}", pb, r, ctx.ui_visible(&pb))); } }
+                        }
+                    }
+                };
+                walk(ctx, "main", &mut out);
+                log(&format!("하단노드 dump({}): {}", out.len(), out.join(" | ")));
+                for side in ["blue", "red"] {
+                    let root = format!("main.{}_picks", side);
+                    let mut v: Vec<String> = Vec::new();
+                    for a in ctx.ui_child_names(&root) { let pa = format!("{}.{}", root, a); if let Some(r) = ctx.ui_node_rect(&pa) { v.push(format!("{}={:?}", a, r)); } }
+                    log(&format!("{} rect: {}", root, v.join(" | ")));
+                }
+            }
+            if DBG && ctx.ui_visible("main.swap").unwrap_or(false) && f % 60 == 0 {
+                log(&format!("swap: phase={:?} me={:?} hide_side={:?}", draft_scene::read().map(|r| (r.phase, r.sent)), ctx.player_team_id(), hide_side));
+            }
+            if HIDE_SIDE_LOG.swap(hide_side.is_some(), Ordering::Relaxed) != hide_side.is_some() {
+                log(&format!("스왑 확정 대기: 상대({}) 일러 ? 처리 = {}", if hide_side == Some(true) { "블루" } else { "레드" }, hide_side.is_some()));
+            }
+            raise_card_children(ctx);
+            let mut want_splash: HashMap<String, String> = HashMap::new();
+            let mut grace = SLOT_GRACE.lock().unwrap_or_else(|e| e.into_inner());
+            for ((is_blue, n), r) in &slot_rects {
+                let team = if *is_blue { "blue" } else { "red" };
+                let slot = format!("main.{}_picks.pick_slot_{}", team, n);
+                let id = slots.get(&(*is_blue, *n)).cloned().unwrap_or_default();  // 가린 진영은 위에서 이미 question_*
+                let key = chosen_key(&il, &id);
+                let sp = format!("{}.done.bp_splash", slot);
+                // ★09-17(유저 제보): 레드 대기 슬롯의 "?" 플레이스홀더까지 좌우반전되던 것 → 챔피언 일러만 반전, question_* 은 반전 안 함.
+                match &key {
+                    Some(k) => { let (a, fl) = art_for(&il, k, *is_blue); want_splash.insert(sp.clone(), format!("{}|{}", a, fl && !id.starts_with("question"))); }
+                    // ★10-21(해외 제보 영상): 팩에 question_* 그림이 없으면 스플래시를 끄게 돼 **스왑 진입 직후 일러가 바닐라 도트로 돌아갔다**
+                    //   (바닐라 "?" 는 ~2.5초 뒤에야 뜬다). 가리는 중에는 모드 기본 "?"(asset/question_blue|red.png)로 덮는다.
+                    //   ★11-11(창작마당 준비): ~~가리는 중에만~~ → 대기 슬롯 전부. 「?」는 유저 그림 폴더·남의 팩에서만 오던 거라
+                    //   그림을 안 넣은 새 구독자는 빈 슬롯이 그냥 어두웠다(설명문 "? until a champion is picked" 와 어긋남). 가린 진영도 id 가 question_* 다.
+                    None if id.starts_with("question") => { want_splash.insert(sp.clone(), format!("asset/{}/asset/{}|false", ASSET_ID, id)); }
+                    None => {}
+                }
+                let hovered = cur.map(|p| inside(*r, p)).unwrap_or(false);
+                let gi = if *is_blue { *n } else { 5 + *n };
+                if hovered { grace[gi] = f + 10; }
+                let show_btn = f < grace[gi] && !id.starts_with("question") && flat_cands(&il, &id).len() >= 2;
+                set_vis(ctx, &format!("{}.done.bp_illust_cycle", slot), show_btn);
+                set_vis(ctx, &format!("{}.done.bp_skin_cycle", slot), false);
+            }
+            drop(grace);
+            {
+                let mut last = LAST_SPLASH.lock().unwrap_or_else(|e| e.into_inner());
+                let lm = last.get_or_insert_with(HashMap::new);
+                for ((is_blue, n), _) in &slot_rects {
+                    let slot = format!("main.{}_picks.pick_slot_{}", if *is_blue { "blue" } else { "red" }, n);
+                    let done = format!("{}.done", slot);
+                    let done_vis = ctx.ui_visible(&done).unwrap_or(false);
+                    // 픽 완료 = done.bp_splash / 대기·차례 = 슬롯 루트 bp_splash_q (둘 다 .ui 정의)
+                    //   ★11-04: ~~bp_splash_q z 300 · bp_dim_q z 305~~ → z 없음. 게임이 대기·차례 슬롯에 붙이는 주장 C·선수 요청(promise) 배지는
+                    //   z 가 없어 「?」 그림 밑에 깔렸다(유저 제보: 픽 전엔 주장 표시가 안 보임). 두 노드는 슬롯 루트의 첫 자식이라 z 없이도
+                    //   wait/in_turn/done 보다 먼저 그려진다(10-29 done 쪽 해결과 같은 원리 — 형제 순서).
+                    let sp = if done_vis { format!("{}.bp_splash", done) } else { format!("{}.bp_splash_q", slot) };
+                    let other = if done_vis { format!("{}.bp_splash_q", slot) } else { format!("{}.bp_splash", done) };
+                    set_vis(ctx, &other, false);
+                    let key_sp = format!("{}.done.bp_splash", slot);
+                    let w = format!("{}|{}", want_splash.get(&key_sp).cloned().unwrap_or_default(), done_vis);
+                    if lm.get(&key_sp) == Some(&w) { continue; }
+                    if !ctx.ui_exists(&sp) { continue; }
+                    let w0 = want_splash.get(&key_sp).cloned().unwrap_or_default();
+                    // ★09-23: 하단 반투명 판은 **일러가 실제로 깔릴 때만** — 일러 없는 카드는 원본 그대로 둔다.
+                    //   픽 완료 = done.bp_dim / 대기·차례("?") = 슬롯 루트 bp_dim_q (유저 요청 09-23: "?" 에서도 글자가 묻힌다)
+                    let dim = if done_vis { format!("{}.bp_dim", done) } else { format!("{}.bp_dim_q", slot) };
+                    let dim_other = if done_vis { format!("{}.bp_dim_q", slot) } else { format!("{}.bp_dim", done) };
+                    set_vis(ctx, &dim_other, false);
+                    set_vis(ctx, &dim, !w0.is_empty());
+                    if w0.is_empty() { set_vis(ctx, &sp, false); }
+                    else {
+                        let (a, flip) = w0.split_once('|').unwrap_or((&w0, "false"));
+                        let ok = ctx.ui_set_properties(&sp, &format!("source: \"{}\";", a));
+                        let _ = ctx.ui_set_properties(&sp, &format!("flip_x: {};", flip));
+                        ctx.ui_set_visible(&sp, true);
+                        // 이름 라벨을 일러스트 위로(원작: 이름을 일러스트 위 우/좌 정렬)
+                        if done_vis { ctx.ui_set_properties(&format!("{}.name", done), "z: 310;"); }
+                        if f < 20000 { log(&format!("splash set {} ← {} flip={} → {}", sp, a, flip, ok)); }
+                    }
+                    let sp = key_sp;
+                    lm.insert(sp, w);
+                }
+            }
+            // ── 블루 슬롯 주장 배지(기존 스타일)
+            // ★10-29(0.7.0): 게임은 주장 「C」를 이름 라벨의 자식으로 x = min(글자폭, 64) + 6 에 붙인다 — 왼쪽 정렬 가정
+            //   (RE `REPORT\banpick_view_plus\RE\2026-10-29_0.7.0-밴픽신규UI노드RE.md` §2-1 B). view_plus 블루 이름은 오른쪽 정렬
+            //   (x 194 · w 96 → 끝 290)이라 C 가 글자 끝과 겹치고 슬롯 밖으로 잘렸다.
+            //   ⟹ 배지가 있으면 배지 위치로 글자폭을 역산해 왼쪽 정렬로 바꾸고 「이름 + 6 + 배지 26」이 290 에 끝나게 x 를 옮긴다.
+            //   글자폭은 이름이 바뀔 때만 다시 잰다(옮긴 직후 프레임은 rect 가 덜 갱신돼 잘못 잴 수 있음 → 진동 방지).
+            //   ★11-04: 정한 값은 캐시에만 두고 실제 쓰기는 `fix_card_labels` 가 매 프레임 한다(게임이 라벨을 새로 만들어도 따라감).
+            //   ~~신규 스타일은 배지가 상태 노드 자식이라 이 경로를 안 탄다~~ — 신규 다크 제보 사진에서도 C 가 이름 옆(= 이름 라벨 자식)이었다.
+            {
+                let mut g = BLUE_NAME.lock().unwrap_or_else(|e| e.into_inner());
+                let cache = g.get_or_insert_with(HashMap::new);
+                for n in 0..5 {
+                    let slot = format!("main.blue_picks.pick_slot_{}", n);
+                    let k = match ctx.ui_node_rect(&slot) { Some(r) if r.2 > 0.0 => r.2 / 300.0, _ => continue };
+                    for st in ["wait", "in_turn", "done"] {
+                        let name = format!("{}.{}.name", slot, st);
+                        if !ctx.ui_exists(&name) { continue; }
+                        let text = ctx.ui_text(&name).unwrap_or_default();
+                        let badge = format!("{}.captain_badge", name);
+                        let has = ctx.ui_exists(&badge);
+                        if let Some((t0, p0)) = cache.get(&name) {
+                            if *t0 == text && p0.starts_with("align_x: Left") == has { continue; }
+                        }
+                        let want = if has {
+                            match (ctx.ui_node_rect(&name), ctx.ui_node_rect(&badge)) {
+                                (Some(nr), Some(br)) if nr.2 > 0.0 && br.2 > 0.0 => {
+                                    let tw = ((br.0 - nr.0) / k - 6.0).clamp(0.0, 64.0);
+                                    format!("align_x: Left; x: {:.0}px;", 290.0 - 32.0 - tw)
+                                }
+                                _ => continue, // 레이아웃 전 — 다음 프레임에
+                            }
+                        } else { BLUE_NAME_DEFAULT.to_string() };
+                        let ok = ctx.ui_set_properties(&name, &want);
+                        log(&format!("captain name {} '{}' badge={} → {} ({})", name, text, has, want, ok));
+                        cache.insert(name, (text, want));
+                    }
+                }
+            }
+            // ── 숙련도 보너스 [제목][알약] 배치 측정(PROF_Y 위 주석) — 제목 실제 폭(fit_width)·알약 폭을 재서 x 를 정한다. 쓰기는 fix_card_labels.
+            //   신규 스타일만(기존 스타일은 게임이 안 옮겨 .ui 배치가 그대로 산다).
+            if NEW_UI.load(Ordering::Relaxed) {
+                let mut g = PROF_X.lock().unwrap_or_else(|e| e.into_inner());
+                let m = g.get_or_insert_with(HashMap::new);
+                for team in ["blue", "red"] {
+                    for n in 0..5 {
+                        let slot = format!("main.{}_picks.pick_slot_{}", team, n);
+                        let done = format!("{}.done", slot);
+                        if ctx.ui_visible(&done) != Some(true) { continue; }
+                        let k = match ctx.ui_node_rect(&slot) { Some(r) if r.2 > 0.0 => r.2 / 300.0, _ => continue };
+                        let (Some(tr), Some(br)) = (ctx.ui_node_rect(&format!("{}.proficiency_badge_title", done)), ctx.ui_node_rect(&format!("{}.proficiency_badge", done))) else { continue };
+                        if tr.2 <= 0.0 || br.2 <= 0.0 { continue; }
+                        let (tw, pw) = (tr.2 / k, br.2 / k);
+                        let want = if team == "blue" { (PROF_BLUE_X0, PROF_BLUE_X0 + tw + PROF_GAP) } else { let bx = PROF_RED_X1 - pw; (bx - PROF_GAP - tw, bx) };
+                        if m.get(&done).map(|o| (o.0 - want.0).abs() < 0.5 && (o.1 - want.1).abs() < 0.5).unwrap_or(false) { continue; }
+                        log(&format!("prof {} title_w={:.0} pill_w={:.0} → x {:.0}/{:.0}", done, tw, pw, want.0, want.1));
+                        m.insert(done, want);
+                    }
+                }
+            }
+            // 진단(bp_diag.flag): 픽 슬롯 상태 노드 자식 목록 — 게임이 붙인 captain/promise 배지 위치 확인용(바뀔 때만)
+            if DIAG.load(Ordering::Relaxed) {
+                let mut v = Vec::new();
+                for team in ["blue", "red"] { for n in 0..5 { for st in ["wait", "in_turn", "done"] {
+                    let p = format!("main.{}_picks.pick_slot_{}.{}", team, n, st);
+                    if ctx.ui_visible(&p) != Some(true) { continue; }
+                    let kids = ctx.ui_child_names(&p);
+                    let cap: Vec<String> = kids.iter().filter(|k| k.contains("badge")).map(|k| format!("{}={:?}", k, ctx.ui_node_rect(&format!("{}.{}", p, k)))).collect();
+                    let nb = ctx.ui_node_rect(&format!("{}.name.captain_badge", p));
+                    v.push(format!("{}:{}.{} kids={:?} badges={:?} name={:?} name.cb={:?}", team, n, st, kids, cap, ctx.ui_node_rect(&format!("{}.name", p)), nb));
+                } } }
+                let s = v.join(" | ");
+                let mut last = SLOTKIDS_LAST.lock().unwrap_or_else(|e| e.into_inner());
+                if *last != s { log(&format!("slotkids {}", s)); *last = s; }
+            }
+            // ── 이름 색
+            let axes = AXES.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default();
+            {
+                let mut g = NAME_COLOR.lock().unwrap_or_else(|e| e.into_inner());
+                let cache = g.get_or_insert_with(HashMap::new);
+                for card in cards.iter().cloned() {
+                    let want = if c.name_color { match axes.get(&card).map(tint_of).unwrap_or(0) { 1 => COLOR_BUFF, -1 => COLOR_NERF, _ => COLOR_NORMAL } } else { COLOR_NORMAL };
+                    if cache.get(&card).map(|x| x == want).unwrap_or(want == COLOR_NORMAL) { continue; }
+                    let p = format!("{}.{}.name", CARDS, card);
+                    if ctx.ui_exists(&p) { ctx.ui_set_properties(&p, &format!("color: {};", want)); cache.insert(card, want.to_string()); }
+                }
+            }
+            // ── 하단 패널 레이아웃
+            // ★09-20: card_area = 카드 rect 실측(보이는 카드의 최대 바닥 − 첫 카드 위). 표 auto 높이는 마지막 1~2줄을 빠뜨렸다(ㅎ 챔프 미표시 제보).
+            // ★0.6.1(09-22, 유저 제보 "여전히 마지막 줄이 살짝 잘린다"): rect 실측은 **스크롤 클립에 잘린 값**이다
+            //   (화면 밖 줄 = 높이 0, 걸친 줄 = 잘린 높이). 그래서 마지막 줄 바닥이 언제나 "클립 바닥"으로 보고되고,
+            //   스페이서가 딱 그만큼만 자라 **마지막 줄이 클립에 닿은 상태로 수렴**한다(자기충족 루프 — +16 여백이 영영 안 생김).
+            //   ⟹ 실측은 **한 칸 높이·열 수**에만 쓰고, 전체 높이는 **카드 수로 계산**한다(스크롤 위치 무관).
+            let card_area = {
+                let mut cell_h = 0.0f32; let mut xs: Vec<f32> = Vec::new(); let mut vis = 0usize;
+                for id in &cards {
+                    let cp = format!("{}.{}", CARDS, id);
+                    if ctx.ui_visible(&cp) != Some(true) { continue; }
+                    vis += 1;
+                    if let Some(r) = ctx.ui_node_rect(&cp) {
+                        if r.3 > 0.0 {
+                            cell_h = cell_h.max(r.3);                         // 완전히 보이는 줄이 진짜 카드 높이를 준다
+                            if !xs.iter().any(|x| (x - r.0).abs() < 1.0) { xs.push(r.0); }
+                        }
+                    }
+                }
+                let cols = xs.len().max(1);
+                if cell_h <= 0.0 || vis == 0 { ctx.ui_node_rect(CARDS).map(|r| r.3).unwrap_or(0.0) }
+                else {
+                    let rows = vis.div_ceil(cols);
+                    rows as f32 * cell_h + rows.saturating_sub(1) as f32 * ROW_GAP
+                }
+            };
+            let (py, vh) = layout_for(card_area, c.show_panel);
+            let sy = spacer_y(card_area, vh);
+            if DBG && f % 60 == 0 {
+                let lastc = cards.last().map(|id| format!("{}.{}", CARDS, id)).unwrap_or_default();
+                log(&format!("rects: clip={:?} contents={:?} spacer(exists={})={:?} last({})={:?}",
+                    ctx.ui_node_rect("main.champions"), ctx.ui_node_rect(CARDS),
+                    ctx.ui_exists("main.champions.bp_spacer"), ctx.ui_node_rect("main.champions.bp_spacer"),
+                    lastc, ctx.ui_node_rect(&lastc)));
+            }
+            {
+                let mut last = LAST_LAYOUT.lock().unwrap_or_else(|e| e.into_inner());
+                if (last.0 - py).abs() > 0.5 || (last.1 - sy).abs() > 0.5 {
+                    let r1 = ctx.ui_set_properties("main.champion_info", &format!("y: {}px;", py as i32));
+                    let r2 = ctx.ui_set_properties("main.champions", &format!("height: {}px;", vh as i32));
+                    let r3 = ctx.ui_set_properties("main.champions.bp_spacer", &format!("y: {}px;", sy as i32));
+                    if DBG { log(&format!("layout: panel y={} view h={} spacer y={} card_area={} cards={} set={}/{}/{}", py, vh, sy, card_area, cards.len(), r1, r2, r3)); }
+                    *last = (py, sy);
+                }
+            }
+        }));
+    }
+    fn post_render(&self, ctx: &mut StableClient<'_>) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if !ACTIVE.load(Ordering::Relaxed) || !cfg().name_color { return; }
+            let Some((id, r)) = HOVER.lock().unwrap_or_else(|e| e.into_inner()).clone() else { return };
+            let axes = AXES.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&id).copied());
+            let Some(axes) = axes else { return };
+            draw_radar(ctx, &axes, r);
+        }));
+    }
+}
+/// 팩 풀다운(10-14): `bp_pack_list`(.ui 정적 · 패널 안 y=362) 안 `list` 스크롤뷰에 행을 첫 펼침 때 스폰한다.
+///   스크롤 범위 = 스페이서 바닥 − 뷰 높이 − bar_padding(4+4) (메인 그리드와 같은 관계식 — `spacer_y` 주석).
+///   펼치면 패널 높이를 목록 아래까지 늘린다(패널 밖으로 삐져나온 자식의 클릭 판정을 믿지 않는다).
+const PACK_ROW_H: usize = 34;
+const PACK_LIST_MAX_ROWS: usize = 8;
+const PACK_LIST_Y: usize = 362;
+const PANEL_H: usize = 412;
+fn draw_pack_list(ctx: &mut StableClient<'_>, rows: &[(String, String, Option<u32>)], staged: Option<usize>, tx: &PackTxt) {
+    let lp = format!("{}.bp_pack_list", PANEL);
+    let sv = format!("{}.list", lp);
+    let open = PACK_LIST_OPEN.load(Ordering::Relaxed) && rows.len() >= 2;
+    if open {
+        if !ctx.ui_exists(&format!("{}.bp_pack_row_0", sv)) {
+            let mut ok = 0;
+            for (i, r) in rows.iter().enumerate() {
+                let t = pack_row_label(r, tx).replace('\\', "").replace('"', "'");
+                let src = format!("bp_pack_row_{i}:color_icon_button {{ @\"asset/base/style/main#tertiary_button\"; z: 952; x: 0px; y: {y}px; width: 276px; height: 32px;\n  #label:label {{ @\"asset/base/style/main#label\"; z: 953; ignore_event: true; x: 10px; width: 256px; height: 100%; size: 14; color: #e8e8e8ff; align_y: Center; text: \"{t}\"; }}\n}}", i = i, y = i * PACK_ROW_H, t = t);
+                if ctx.ui_spawn_source(&sv, &src) { ok += 1; }
+            }
+            let sp = ctx.ui_spawn_source(&sv, &format!("bp_pack_spacer:empty {{ x: 0px; y: {}px; width: 8px; height: 10px; }}", rows.len() * PACK_ROW_H - 2));
+            log(&format!("팩 풀다운 행 스폰 {}/{} spacer={}", ok, rows.len(), sp));
+        }
+        {
+            let mut g = PACK_ROW_CLICKS.lock().unwrap_or_else(|e| e.into_inner());
+            let set = g.get_or_insert_with(BTreeSet::new);
+            for i in 0..rows.len() {
+                let p = format!("{}.bp_pack_row_{}", sv, i);
+                if set.contains(&p) || !ctx.ui_exists(&p) { continue; }
+                let tag = format!("packrow:{}", i);
+                if ctx.ui_register_click(&p, "", move |_| push_click(&tag)) { set.insert(p); }
+            }
+        }
+        let h = rows.len().min(PACK_LIST_MAX_ROWS) * PACK_ROW_H + 8;
+        let _ = ctx.ui_set_properties(&lp, &format!("height: {}px;", h));
+        let _ = ctx.ui_set_properties(&sv, &format!("height: {}px;", h - 8));
+        let _ = ctx.ui_set_properties(PANEL, &format!("height: {}px;", (PACK_LIST_Y + h + 12).max(PANEL_H)));
+        for i in 0..rows.len() {
+            let col = if staged == Some(i) { "#f2c14eff" } else { "#e8e8e8ff" };
+            let _ = ctx.ui_set_properties(&format!("{}.bp_pack_row_{}.label", sv, i), &format!("color: {};", col));
+        }
+    } else {
+        let _ = ctx.ui_set_properties(PANEL, &format!("height: {}px;", PANEL_H));
+    }
+    set_vis(ctx, &lp, open);
+    let _ = ctx.ui_set_properties(&format!("{}.bp_pack_cycle.next", PANEL), if open { "source: \"asset/base/ui/icons/dropdown_up\";" } else { "source: \"asset/base/ui/icons/dropdown\";" });
+}
+/// 진단: ⚙(DISC) 중심점을 rect 로 포함하는 보이는 노드(main 이하 깊이 4 · 카드 그리드 제외) — 바뀔 때만 기록.
+fn diag_hit(ctx: &mut StableClient<'_>) {
+    // z 시험: bp_ztest.flag 가 있으면 ⚙ 를 z 5000 으로(덮개가 z 우선이면 이것만으로 풀린다)
+    if mod_dir().map(|d| std::path::Path::new(&format!(r"{}\bp_ztest.flag", d)).exists()).unwrap_or(false) { let ok = ctx.ui_set_properties(DISC, "z: 5000;"); if !ZTEST_LOGGED.swap(true, Ordering::Relaxed) { log(&format!("diag ⚙ z=5000 적용 {}", ok)); } }
+    let Some((gx, gy, gw, gh)) = ctx.ui_node_rect(DISC) else { log("diag: ⚙ rect 없음"); return };
+    let (cx, cy) = (gx + gw * 0.5, gy + gh * 0.5);
+    let mut hits: Vec<String> = Vec::new();
+    let mut stack: Vec<(String, usize)> = vec![(ROOT.to_string(), 0)];
+    let mut n = 0usize;
+    while let Some((p, d)) = stack.pop() {
+        n += 1; if n > 4000 { break; }
+        if p == CARDS { continue; }
+        if let Some((x, y, w, h)) = ctx.ui_node_rect(&p) {
+            if cx >= x && cx <= x + w && cy >= y && cy <= y + h && ctx.ui_visible(&p) == Some(true) {
+                hits.push(format!("{} [{:.0},{:.0},{:.0},{:.0}] {}", p, x, y, w, h, ctx.ui_runner_name(&p).unwrap_or_default()));
+            }
+        }
+        if d < 6 { for c in ctx.ui_child_names(&p) { stack.push((format!("{}.{}", p, c), d + 1)); } }
+    }
+    let side = draft_scene::read().map(|r| format!("phase={}", r.phase)).unwrap_or_default();
+    let line = format!("diag ⚙ center=({:.0},{:.0}) visible={:?} open={} {} hits={}\n  {}", cx, cy, ctx.ui_visible(DISC), SETTINGS_OPEN.load(Ordering::Relaxed), side, hits.len(), hits.join("\n  "));
+    let mut g = DIAG_LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if *g != line { *g = line.clone(); drop(g); log(&line); }
+}
+fn deactivate() {
+    SWAP_ACTIVE.store(false, Ordering::Relaxed);
+    // ★10-14 레드/2세트 ⚙ 클릭 불가 진범: 밴픽 씬이 다시 만들어지면 ui_register_click 등록이 사라진다(인게임 진단 — 2번째 밴픽부터 ⚙·리스너 이벤트 0건).
+    //   ⟹ 밴픽을 벗어날 때 등록 플래그를 풀어 다음 진입에서 다시 등록. 등록이 살아 있어 이중 발화해도 클릭 묶음 중복 제거가 상쇄를 막는다.
+    if ACTIVE.load(Ordering::Relaxed) { CLICKS_REGISTERED.store(false, Ordering::Relaxed); *PACK_ROW_CLICKS.lock().unwrap_or_else(|e| e.into_inner()) = None; }
+    if ACTIVE.swap(false, Ordering::Relaxed) { SETTINGS_OPEN.store(false, Ordering::Relaxed); PACK_LIST_OPEN.store(false, Ordering::Relaxed); *PICK_STATE.lock().unwrap_or_else(|e| e.into_inner()) = None; *HOVER.lock().unwrap_or_else(|e| e.into_inner()) = None; *HOVER_BG_KEY.lock().unwrap_or_else(|e| e.into_inner()) = None; }
+}
+/// 원작 draw_radar_octagon 재현(UI 맵 드로잉). 카드 오른쪽/왼쪽 옆에 그린다(게임 자체 포지션 툴팁은 카드 위·아래).
+fn draw_radar(ctx: &mut StableClient<'_>, axes: &[f32; 8], card: (f32, f32, f32, f32)) {
+    use std::f32::consts::PI;
+    const ORD: [usize; 8] = [0, 1, 7, 2, 3, 4, 6, 5];
+    const MAXPCT: f32 = 0.15;
+    let r = 60.0f32; let r0 = r * 0.55; let rmin = r * 0.20; let icon_rad = r + 12.0; let ext = r + 24.0;
+    // ★09-28 유저 제보 "호버하면 나오는 포지션 부분 한글이 깨진다": ~~카드 위(공간 없으면 아래)~~ = 게임 자체 포지션 툴팁
+    //   ("주 사용 포지션", 카드 위·아래)과 같은 자리라 레이더가 그 글자를 덮었다 → 카드 **오른쪽**(화면 밖이면 왼쪽) 옆에 그린다.
+    let right = card.0 + card.2 + 5.0 + 2.0 * ext <= 1920.0;
+    let cx = if right { card.0 + card.2 + 5.0 + ext } else { card.0 - 5.0 - ext };
+    let cy = (card.1 + card.3 / 2.0).clamp(ext, 1080.0 - ext);
+    let ang = |i: usize| -PI / 2.0 + i as f32 * (PI / 4.0);
+    let pt = |i: usize, rad: f32| (cx + rad * ang(i).cos(), cy + rad * ang(i).sin());
+    let cur_r = |i: usize| { let d = (axes[ORD[i]] / MAXPCT).clamp(-1.0, 1.0); if d >= 0.0 { r0 + d * (r - r0) } else { r0 + d * (r0 - rmin) } };
+    let net: f32 = axes.iter().sum();
+    let (netcol, fillc) = if net > 0.01 { (0x57db78ff, 0x57db7840) } else if net < -0.01 { (0xf7666bff, 0xf7666b40) } else { (0x73b8faff, 0x73b8fa40) };
+    let z = 108;
+    ctx.draw_circle("UI", cx, cy, icon_rad + 11.0, z, 0x07080bd9);
+    for i in 0..8 { let (x, y) = pt(i, r - 2.0); ctx.draw_line("UI", cx, cy, x, y, 1.0, z + 2, 0xd9e0f229); }
+    for (rad, col, w) in [(r0, 0x8c99b88cu32, 1.2f32), (r, 0x8c99b88c, 1.2)] { for i in 0..8 { let (x1, y1) = pt(i, rad); let (x2, y2) = pt((i + 1) % 8, rad); ctx.draw_line("UI", x1, y1, x2, y2, w, z + 3, col); } }
+    // 채움 근사: 중심→각 꼭짓점 굵은 선(폴리곤 API 없음)
+    for i in 0..8 { let (x, y) = pt(i, cur_r(i)); ctx.draw_line("UI", cx, cy, x, y, 6.0, z + 4, fillc); }
+    for i in 0..8 { let (x1, y1) = pt(i, cur_r(i)); let (x2, y2) = pt((i + 1) % 8, cur_r((i + 1) % 8)); ctx.draw_line("UI", x1, y1, x2, y2, 2.4, z + 5, netcol); }
+    // 스탯 아이콘(게임 시트 asset/base/ui/banpick/champion_stat_icon#sheet = 80×10px, 칸 보폭 0.125 · 아이콘 폭 0.1125).
+    // ★09-28 유저 제보 "8각형 레이더 아이콘이 이상하다": ~~보폭 0.1125 + 축 순서 그대로~~ → 시트 정의(#data.sprite_sheet) 좌표를
+    //   축 순서 [attack, magic, hp, def, mr, move, range, atkspeed] 에 맞춰 매핑
+    //   (ad 0 · ap .125 · armor .25 · hp .375 · range .5 · speed .625 · attack_speed .75 · magic resistance .875).
+    const ICON_UVX: [f32; 8] = [0.0, 0.125, 0.375, 0.25, 0.875, 0.625, 0.5, 0.75];
+    for i in 0..8 {
+        let (icx, icy) = pt(i, icon_rad);
+        let p = StableSpriteParams { x: icx, y: icy, z: z + 6, pivot_x: 0.5, pivot_y: 0.5, uv: (ICON_UVX[ORD[i]], 0.0, 0.1125, 0.9), sample_nearest: true, ..Default::default() };
+        ctx.draw_sprite("UI", "asset/base/ui/banpick/champion_stat_icon#sheet", &p);
+    }
+    let pct = (net * 100.0).round() as i32;
+    ctx.draw_text("UI", &format!("{}{}%", if pct > 0 { "+" } else { "" }, pct), "asset/base/font/set/bold", (cx - 40.0, cy + icon_rad + 14.0, 80.0, 20.0), z + 6, 13.0, netcol, TextAlignXV1::Center, TextAlignYV1::Center);
+}
+
+fn init(host: &StableHost) -> StableMod {
+    host.log(LogLevel::Info, "banpick_view_plus (stable 0.6.0)");
+    *CFG.lock().unwrap_or_else(|e| e.into_inner()) = load_cfg();
+    let v = host.game_version();
+    log(&format!("INIT game {}.{}.{} host_abi={} mod_dir={:?}", v.major, v.minor, v.patch, host.abi_level(), mod_dir()));
+    let _ = illust(); // 팩 복사·인덱스(에셋 등록이 시작 시점이면 다음 실행부터 반영)
+    let mut d = StableMod::new(MOD_ID);
+    d.set_extension(Ext);
+    d
+}
+#[cfg(not(feature = "embedded"))]
+declare_stable_mod!(init);
+
+// ───────── 통합판(daram2_view_plus) 모듈 진입 — feature "embedded" 일 때만 컴파일(단독 빌드엔 없음 · 2026-11-11) ─────────
+#[cfg(feature = "embedded")]
+pub mod embedded {
+    use super::*;
+    /// 통합판 init 에서 1회. 모드 폴더는 원래부터 dll 위치(`mod_dir()`)라 넘겨받은 폴더는 쓰지 않는다(같은 곳).
+    ///   단독판 `init()` 과 같은 부수효과(설정·일러 팩 준비) 뒤 (클라 확장, 서버 확장 없음).
+    pub fn init(host: &StableHost, _mod_dir: &str) -> (Box<dyn StableExtension>, Option<Box<dyn mod_api_stable::StableServerExtension>>) {
+        host.log(LogLevel::Info, "banpick_view_plus (stable 0.6.0 · daram2_view_plus module)");
+        *CFG.lock().unwrap_or_else(|e| e.into_inner()) = load_cfg();
+        let v = host.game_version();
+        log(&format!("INIT game {}.{}.{} host_abi={} mod_dir={:?} (embedded)", v.major, v.minor, v.patch, host.abi_level(), mod_dir()));
+        let _ = illust();
+        (Box::new(Ext), None)
+    }
+}

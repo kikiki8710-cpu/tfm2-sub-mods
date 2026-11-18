@@ -1,0 +1,17 @@
+[package]
+name = "tfm2_detail_tactics"
+version = "0.2.8"
+edition = "2021"
+[lib]
+crate-type = ["cdylib", "rlib"]
+[features]
+default = []
+replay_ab = []
+[dependencies]
+mod-api-stable = { path = "../mod-api-stable" }
+serde_json = "1.0.151"
+[workspace]
+[profile.release]
+opt-level = 1
+overflow-checks = false
+panic = "unwind"

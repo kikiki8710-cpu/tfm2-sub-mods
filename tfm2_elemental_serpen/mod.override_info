@@ -1,0 +1,6 @@
+{
+  "asset/base/text/object": {
+    "remapping": "asset/tfm2_elemental_serpen/text/serpen_object",
+    "type": "merge"
+  }
+}

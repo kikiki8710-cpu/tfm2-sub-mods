@@ -1,0 +1,43 @@
+//! 라인·콜 추가전술의 원래 register snapshot만 읽는 계산 콜백.
+//! 0.7.2 입력: lane_range_a=rdx · lane_range_b=rbx(0.7.1 r12 · 사거리 헬퍼 0xef4280 분리) · lane_range_c=r14(0.7.1 rdi) · gank_recheck=rsi(0.7.1 r15) · gank_deadline=[rbp+0x138](0.7.3 · 0.7.2 0x130 · 0.7.1 0xb8 · 0.7.0 0xc8) · tactical_roam_self_hp=rsi(0.7.1 r12).
+use crate::micro::{Frame,Src};
+fn valid_tps(t:u64)->Option<u64>{if t>0 && t<=100000 {Some(t)} else {None}}
+fn half_tps(t:u64)->Option<u64>{if t&1!=0 {None}else{valid_tps(t/2)}}
+fn tps_mul(t:u64,v:i64)->Option<u64>{Some(valid_tps(t)?.wrapping_mul(u64::try_from(v).ok()?))}
+pub(crate) fn gank_deadline(f:&Frame,v:i64)->Option<u64>{if !(0..=1000000).contains(&v){return None;}tps_mul(f.scalar(Src::Mem(5,0x138))?,v)} // 0.7.3 TPS=[rbp+0x138] (0xf7b53b 저장 · 0.7.2 0x130 · 0.7.1 0xb8 · 0.7.0 0xc8)
+pub(crate) fn call_early(f:&Frame,v:i64)->Option<u64>{if !(0..=1000000).contains(&v){return None;}tps_mul(f.reg(1)?,v)}
+pub(crate) fn call_diagnostic(f:&Frame,v:i64)->Option<u64>{if !(0..=1000000).contains(&v){return None;}tps_mul(f.reg(1)?,v)}
+pub(crate) fn call_general(f:&Frame,v:i64)->Option<u64>{if !(0..=1000000).contains(&v){return None;}tps_mul(f.reg(0)?,v)}
+pub(crate) fn same_lane_retry(f:&Frame,v:i64)->Option<u64>{if !(0..=1000000).contains(&v){return None;}tps_mul(half_tps(f.reg(0)?)?,v)}
+pub(crate) fn pregank_hp(_f:&Frame,v:i64)->Option<u64>{if !(0..=1000000).contains(&v){return None;}Some((35u64).wrapping_mul(v as u64)/100)}
+pub(crate) fn pregank_radius(_f:&Frame,v:i64)->Option<u64>{if !(0..=1000000).contains(&v){return None;}{let r=200000u64.wrapping_mul(v as u64)/100;Some(r.wrapping_mul(r))}}
+// 0.7.2 신설 E004 갱 시도 시 적 확인 거리: 평가 입구 0xe6b8c1 「근처에 보이는 적 챔프」 반경 250000(World vt+0x40 이면 150000).
+pub(crate) fn pregank_enemy_radius(_f:&Frame,v:i64)->Option<u64>{if !(25..=400).contains(&v){return None;}{let r=250000u64.wrapping_mul(v as u64)/100;Some(r.wrapping_mul(r))}} // 0xe6b903 rcx
+pub(crate) fn pregank_enemy_radius_alt(_f:&Frame,v:i64)->Option<u64>{if !(25..=400).contains(&v){return None;}{let r=150000u64.wrapping_mul(v as u64)/100;Some(r.wrapping_mul(r))}} // 0xe6b90d rax
+pub(crate) fn defense_risk(_f:&Frame,v:i64)->Option<u64>{if !(0..=1000000).contains(&v){return None;}Some(35u64.wrapping_mul(v as u64)/100)}
+pub(crate) fn defense_long(_f:&Frame,v:i64)->Option<u64>{if !(0..=1000000).contains(&v){return None;}Some(25u64.wrapping_mul(v as u64)/100)}
+pub(crate) fn defense_short(_f:&Frame,v:i64)->Option<u64>{if !(0..=1000000).contains(&v){return None;}Some(10u64.wrapping_mul(v as u64)/100)}
+pub(crate) fn gank_recheck(f:&Frame,v:i64)->Option<u64>{if !(0..=1000000).contains(&v){return None;}tps_mul(f.reg(6)?,v)} // 0.7.2 TPS=rsi (0.7.0~0.7.1 r15 · 0.6.5 r14)
+pub(crate) fn roam_extra(f:&Frame,v:i64)->Option<u64>{if !(0..=1000000).contains(&v){return None;}tps_mul(f.reg(1)?,v)}
+pub(crate) fn lane_range_a(f:&Frame,v:i64)->Option<u64>{if !(0..=1000000).contains(&v){return None;}Some(f.reg(2)?.wrapping_mul(v as u64+2))}
+pub(crate) fn lane_range_b(f:&Frame,v:i64)->Option<u64>{if !(0..=1000000).contains(&v){return None;}Some(f.reg(3)?.wrapping_mul(v as u64+2))}
+pub(crate) fn lane_range_c(f:&Frame,v:i64)->Option<u64>{if !(0..=1000000).contains(&v){return None;}Some(f.reg(14)?.wrapping_mul(v as u64+2))}
+pub(crate) fn superiority_hp(_f:&Frame,v:i64)->Option<u64>{if !(0..=1000000).contains(&v){return None;}Some(20+5*v as u64)}
+pub(crate) fn superiority_count(_f:&Frame,v:i64)->Option<u64>{if !(0..=1000000).contains(&v){return None;}Some(1+v as u64)}
+pub(crate) fn lane_call_cap(f:&Frame,v:i64)->Option<u64>{if !(0..=1000000).contains(&v){return None;}tps_mul(f.scalar(Src::Mem2(7,8,0x12f8))?,v)}
+pub(crate) fn lane_call_deadline_half(f:&Frame,v:i64)->Option<u64>{if !(0..=1000000).contains(&v){return None;}{let t=f.reg(0)?;if v%2!=0{return None;}tps_mul(t,v/2)}}
+pub(crate) fn mia_global(f:&Frame,v:i64)->Option<u64>{if !(0..=1000000).contains(&v){return None;}{let t=valid_tps(f.reg(1)?)?;Some(t.wrapping_mul(v as u64)/100)}}
+pub(crate) fn mia_memory(f:&Frame,v:i64)->Option<u64>{if !(0..=1000000).contains(&v){return None;}{let t=valid_tps(f.reg(1)?)?;Some(f.reg(2)?.wrapping_add(t.wrapping_mul(4).wrapping_mul(v as u64)/100))}}
+pub(crate) fn mia_hp(_f:&Frame,v:i64)->Option<u64>{if !(0..=1000000).contains(&v){return None;}Some(60u64.wrapping_mul(v as u64)/100)}
+pub(crate) fn mia_radius(_f:&Frame,v:i64)->Option<u64>{if !(0..=1000000).contains(&v){return None;}{if v==0{return None;}let r=170000u64.wrapping_mul(100)/(v as u64);Some((r.wrapping_mul(r)>>8).wrapping_sub(1))}}
+pub(crate) fn relay_limit(f:&Frame,v:i64)->Option<u64>{if !(0..=1000000).contains(&v){return None;}{let t=valid_tps(f.scalar(Src::Mem(9,0x12f8))?)?;Some(t.wrapping_mul(v as u64)/100)}}
+/// 0.7.0~ 전술 로밍(Player+0x2c5) 경로 자기 체력 검사 — 0.7.1 창 0xe40164 `test r12,r12 ; je 거부`의 첫 명령을 `test r11,r11` 로 바꿔 쓴다.
+/// rsi = 자기 엔티티(0.7.2 · 0.7.1 = r12 · 0.7.0 = r14 · 창 0xe4300f `test rsi,rsi`). 반환 0 = 거부(je 성립), 그 밖 = rsi 그대로(= 원래 test 결과와 같음).
+/// HP% = [e+0x668]*100 / max([e+0x620],1) — 고전 창 0xe42e62~0xe42f1a 와 같은 부호 없는 식, 비교도 같은 `HP% < 값 → 거부`.
+/// 원본 경로엔 이 검사가 없으므로 기본 단계(값 미설정)에서는 dispatch 가 원본 창으로 보내 바닐라와 같다.
+pub(crate) fn tactical_roam_self_hp(f:&Frame,v:i64)->Option<u64>{
+    if !(0..=127).contains(&v){return None;}
+    let e=f.reg(6)?; if e==0 {return Some(0);}
+    let hp=f.scalar(Src::Mem(6,0x668))?; let max=f.scalar(Src::Mem(6,0x620))?.max(1);
+    Some(if hp.wrapping_mul(100)/max<v as u64 {0} else {e})
+}

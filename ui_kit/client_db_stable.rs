@@ -1,0 +1,114 @@
+//! client_db_stable — stable 클라 ctx(`StableClient`) → 엔진 `ClientDatabase` 포인터 + 재생 커서/이벤트 길이 (0.6.0 전용 RE 값).
+//! 근거: `mods_report/Spectator_Chat/RE/2026-09-17_0.6.0-stable클라ctx→ClientDatabase-경로.md`
+//!   db = [[state+0x68]+0x38] + 0x18  (state = ClientCtxV1+0x30 · state+0x68 = &Scene(tag 6 = InGame) · payload+0x30 = Rc<RefCell<ClientDatabase>> · RcBox value +0x18)
+//!   자가검증: `[db+0xf178] == ctx.player_team_id()` 불일치면 None(레이아웃 stale).
+//! 0.6.0 오프셋: scene 태그 db+0x1360(u64, InGame=0xb) · 라이브 played db+0x15c8 · 라이브 events cap/ptr/len db+0x16a0/0x16a8/0x16b0
+//!   · 리플레이 game_view Option db+0x948(None ⇔ u64::MAX) · 리플레이 played db+0xba8 · 리플레이 events db+0xc80/0xc88/0xc90.
+//! 사용: `#[path = r"C:\tfm2mods\ui_kit\client_db_stable.rs"] mod cdb;` → `cdb::client_db(ctx)` / `cdb::play_cursor(ctx)`.
+#![allow(dead_code)]
+use mod_api_stable::StableClient;
+
+pub const GAME_VER: &str = "0.6.4"; // ★0.6.4: ClientDatabase 0x1740~0x2338 사이 −0x138 축소 — 밴픽 UPDATE 30쌍·REFRESH 14쌍·CGATE·스왑 2함수 정렬 일관(0xe7f0→0xe6b8 · 0xf238→0xf100 · 0xf2ce→0xf196) // ★0.6.2(09-30): ClientDatabase 0x16b0~0x23b0 사이에 +0xa8 삽입 — 0x16b0 이하(재생 커서·이벤트·씬태그) 불변(ctx=0xf178 함수 정렬 투표) · 0xe740/0xe750/0xf178 은 +0xa8. ~~0.6.1: 0.6.0 오프셋 전부 불변 확인(참조 함수 0x291b10→0x2929c0 disp 7/7 동일 · 0xf178 11/11 · 2026-09-22)~~
+pub const OFF_SCENE_TAG: usize = 0x13c0;  // ★0.6.3 cmp [rdx+0x13d8],2 — ⚠0.6.2 에서 이미 이동(0.6.2 마이그 누락 · db=RcBox+0x18, 게임 disp−0x18)
+pub const SCENE_TAG_INGAME: u64 = 0xb;
+pub const OFF_LIVE_PLAYED: usize = 0x1658;  // ★0.6.3 [r8+0x1670] — ⚠0.6.2 에서 이미 이동(0.6.2 마이그 누락 · db=RcBox+0x18, 게임 disp−0x18)
+pub const OFF_LIVE_EV_CAP: usize = 0x1730;  // ★0.6.3 +0x90 — ⚠0.6.2 에서 이미 이동(0.6.2 마이그 누락 · db=RcBox+0x18, 게임 disp−0x18)
+pub const OFF_LIVE_EV_PTR: usize = 0x1738;  // ★0.6.3 [r8+0x1750] — ⚠0.6.2 에서 이미 이동(0.6.2 마이그 누락 · db=RcBox+0x18, 게임 disp−0x18)
+pub const OFF_LIVE_EV_LEN: usize = 0x1740;  // ★0.6.3 [r8+0x1758] — ⚠0.6.2 에서 이미 이동(0.6.2 마이그 누락 · db=RcBox+0x18, 게임 disp−0x18)
+pub const OFF_GAME_VIEW: usize = 0x948;
+pub const OFF_REPLAY_PLAYED: usize = 0xbd8;  // ★0.6.3 [r8+0xbf0] — ⚠0.6.2 에서 이미 이동(0.6.2 마이그 누락 · db=RcBox+0x18, 게임 disp−0x18)
+pub const OFF_REPLAY_EV_CAP: usize = 0xcb0;  // ★0.6.3 +0x30 — ⚠0.6.2 에서 이미 이동(0.6.2 마이그 누락 · db=RcBox+0x18, 게임 disp−0x18)
+pub const OFF_REPLAY_EV_PTR: usize = 0xcb8;  // ★0.6.3 [r8+0xcd0] — ⚠0.6.2 에서 이미 이동(0.6.2 마이그 누락 · db=RcBox+0x18, 게임 disp−0x18)
+pub const OFF_REPLAY_EV_LEN: usize = 0xcc0;  // ★0.6.3 [r8+0xcd8] — ⚠0.6.2 에서 이미 이동(0.6.2 마이그 누락 · db=RcBox+0x18, 게임 disp−0x18)
+pub const OFF_PLAYER_TEAM: usize = 0xf3c8; // ★0.7.0 +0x2e0(0.6.4~0.6.5=0xf0e8 · game disp 0xf100→0xf3e0 57표 · RE champion_exclude 2026-10-28) // ★0.6.4 −0x138(0.6.2~0.6.3=0xf220) // ★0.6.2(0.6.1=0xf178) +0xa8 · 153/155 함수 정렬 투표
+const OFF_CTX_STATE: usize = 0x30;
+
+#[link(name = "kernel32")]
+extern "system" { fn VirtualQuery(addr: *const core::ffi::c_void, buf: *mut MemBasicInfo, len: usize) -> usize; }
+#[repr(C)] #[derive(Default)]
+struct MemBasicInfo { base: usize, alloc_base: usize, alloc_protect: u32, _p0: u32, region_size: usize, state: u32, protect: u32, typ: u32, _p1: u32 }
+pub unsafe fn readable(addr: usize, len: usize) -> bool {
+    if addr < 0x10000 || addr >= (1usize << 48) || len == 0 { return false; }
+    let mut mbi = MemBasicInfo::default();
+    if VirtualQuery(addr as *const _, &mut mbi, core::mem::size_of::<MemBasicInfo>()) == 0 { return false; }
+    const COMMIT: u32 = 0x1000; const RD: u32 = 0x02 | 0x04 | 0x20 | 0x40; const GUARD: u32 = 0x01 | 0x100;
+    if mbi.state != COMMIT || mbi.protect & GUARD != 0 || mbi.protect & RD == 0 { return false; }
+    addr.wrapping_add(len) <= mbi.base.wrapping_add(mbi.region_size)
+}
+pub unsafe fn rd_u64(addr: usize) -> Option<u64> { if readable(addr, 8) { Some(core::ptr::read_unaligned(addr as *const u64)) } else { None } }
+pub unsafe fn rd_u32(addr: usize) -> Option<u32> { if readable(addr, 4) { Some(core::ptr::read_unaligned(addr as *const u32)) } else { None } }
+
+fn raw_ctx(ctx: &StableClient<'_>) -> usize { unsafe { core::ptr::read(ctx as *const StableClient<'_> as *const usize) } }
+
+/// ClientDatabase 시작 주소. 씬이 InGame(앱 씬)이 아니거나 RefCell 이 borrow_mut 중이거나 자가검증 실패면 None.
+pub fn client_db(ctx: &StableClient<'_>) -> Option<usize> {
+    unsafe {
+        let raw = raw_ctx(ctx);
+        if !readable(raw, 0x38) { return None; }
+        let state = rd_u64(raw + OFF_CTX_STATE)? as usize;
+        let scene = rd_u64(state + 0x68)? as usize;
+        if rd_u32(scene)? != 6 { return None; }
+        let q = rd_u64(scene + 0x38)? as usize;
+        let borrow = rd_u64(q + 0x10)? as i64;
+        if borrow < 0 { return None; }
+        let db = q + 0x18;
+        if !readable(db + OFF_PLAYER_TEAM, 8) { return None; }
+        if let Some(t) = ctx.player_team_id() { if rd_u64(db + OFF_PLAYER_TEAM)? as usize != t { return None; } }
+        Some(db)
+    }
+}
+
+pub struct PlayCursor { pub replay: bool, pub played: u64, pub ev_len: u64, pub ev_ptr: u64, pub scene_tag: u64 }
+/// 재생 커서(리플레이 game_view 우선, 없으면 라이브 InGame 씬). 불변식(ptr 유효·len ≤ 1e7·played ≤ len+600) 위반 시 None.
+pub fn play_cursor(ctx: &StableClient<'_>) -> Option<PlayCursor> {
+    unsafe {
+        let db = client_db(ctx)?;
+        let tag = rd_u64(db + OFF_SCENE_TAG)?;
+        let gv = rd_u64(db + OFF_GAME_VIEW)?;
+        let (replay, played, len, ptr) = if gv != u64::MAX {
+            (true, rd_u64(db + OFF_REPLAY_PLAYED)?, rd_u64(db + OFF_REPLAY_EV_LEN)?, rd_u64(db + OFF_REPLAY_EV_PTR)?)
+        } else if tag == SCENE_TAG_INGAME {
+            (false, rd_u64(db + OFF_LIVE_PLAYED)?, rd_u64(db + OFF_LIVE_EV_LEN)?, rd_u64(db + OFF_LIVE_EV_PTR)?)
+        } else { return None };
+        if ptr < 0x10000 || ptr >= (1u64 << 48) || len > 10_000_000 || played > len + 600 { return None; }
+        Some(PlayCursor { replay, played, ev_len: len, ev_ptr: ptr, scene_tag: tag })
+    }
+}
+
+/// ★09-28 출시분 챔피언 id 목록 = `ClientDatabase.available_champions`(cdb+0xe740 Vec cap/ptr/len · 원소 0x18 = String cap/ptr/len).
+///   근거 = champ_pos_lock `read_available`(RE 09-17 · 0.6.1 인게임 98종 일치 09-28).
+///   ⚠**왜 필요한가**: stable `ctx.champion_names()` 는 모드 챔피언이 늘수록 급격히 느려진다
+///   (09-28 실측 60종 1.6ms → 98종 577ms). 밴픽 진입·주기 점검에서 부르면 그만큼 프레임이 멈춘다 → 이 raw 읽기(≈0.3ms)로 대체.
+///   레이아웃 stale 가드: len ≤ 4096 · 문자열 1..=64B · 유효 UTF-8·제어문자/공백 없음(모드 챔프 id 에 비ASCII 가능). 하나라도 어긋나면 None(호출측이 champion_names 로 폴백).
+pub const OFF_AVAIL_CHAMPS: usize = 0xe8d8; // ★0.7.0 +0x228(0.6.4~0.6.5=0xe6b0 · 0xe6b0..0xe6d8 대역 일괄 · RE champion_exclude 2026-10-28) // ★0.6.4 −0x138(0.6.2~0.6.3=0xe7e8 · 신 ptr/len 0xe6b8/0xe6c0 정렬 4/4) // ★0.6.2(0.6.1=0xe740) +0xa8 · cap/ptr/len 0xe7e8/0xe7f0/0xe7f8 투표 19/32/39
+pub fn available_champion_ids(ctx: &StableClient<'_>) -> Option<Vec<String>> {
+    let db = client_db(ctx)?;
+    unsafe {
+        let cap = rd_u64(db + OFF_AVAIL_CHAMPS)? as usize;
+        let ptr = rd_u64(db + OFF_AVAIL_CHAMPS + 8)? as usize;
+        let len = rd_u64(db + OFF_AVAIL_CHAMPS + 0x10)? as usize;
+        if len == 0 || len > cap || len > 4096 || !readable(ptr, len * 0x18) { return None; }
+        let mut out = Vec::with_capacity(len);
+        for i in 0..len {
+            let e = ptr + i * 0x18;
+            let sp = core::ptr::read_unaligned((e + 8) as *const usize);
+            let sl = core::ptr::read_unaligned((e + 0x10) as *const usize);
+            if sl == 0 || sl > 64 || !readable(sp, sl) { return None; }
+            let Ok(st) = core::str::from_utf8(core::slice::from_raw_parts(sp as *const u8, sl)) else { return None };
+            if st.chars().any(|c| c.is_control() || c == ' ') { return None; }
+            out.push(st.to_string());
+        }
+        Some(out)
+    }
+}
+/// 출시분 챔피언 수(cdb+0xe750 u64 한 번 읽기) — 목록이 바뀌었는지 싸게 감지하는 키. 실패 = None.
+pub fn available_len(ctx: &StableClient<'_>) -> Option<u64> {
+    let db = client_db(ctx)?;
+    let n = unsafe { rd_u64(db + OFF_AVAIL_CHAMPS + 0x10)? };
+    if n > 4096 { None } else { Some(n) }
+}
+/// 챔피언 id 목록(빠른 경로 우선): 출시분 raw 읽기 → 실패 시 `ctx.champion_names()`(느림 · registry 전체).
+/// ⚠의미 차이: 빠른 경로는 **출시분만**(미출시 제외). registry 전체가 필요한 곳(미출시 계산)은 쓰지 말 것.
+pub fn champion_ids_fast(ctx: &StableClient<'_>) -> Vec<String> {
+    available_champion_ids(ctx).unwrap_or_else(|| ctx.champion_names())
+}

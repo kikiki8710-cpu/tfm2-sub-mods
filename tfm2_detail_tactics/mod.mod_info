@@ -1,0 +1,15 @@
+{
+  "name": "Detail Tactics",
+  "mod_id": "tfm2_detail_tactics",
+  "author": "tfm2mods",
+  "version": "0.2.8",
+  "mod_type": "native",
+  "contains_code": true,
+  "description": "Fine-tune how your team's AI decides, per position.\n\nAdds a Detail Tactics window to the Team Tactics screen: 63 decision thresholds (retreat HP, gank conditions, push and defense rules and more) in 8 tabs, each set to Default, Low or High for every position or for the whole team.\n\n* Default = the game's own logic runs untouched.\n* Only your team is affected; opponents are never changed.\n* OK applies the settings and stores them in the current save (save the game to keep them). Reset All returns every tactic to the game default.\n* If a decision point does not match what the mod expects, that tactic keeps the game default and the window says \"Install failed (game default)\".\n\nThe numbers behind Low and High are in detail_tactics_values.cfg in the mod folder (picked up automatically within a few seconds).\n\nBuilt for game 0.7.3. The mod hooks the game's AI code, so it is rebuilt for each game update; on any other game version the game disables it. Code mod (native DLL, Windows only). The window is in Korean when the game is set to Korean and in English otherwise.",
+  "dependencies": [
+    {
+      "mod_id": "base",
+      "version": ">=0.7.3, <0.7.4"
+    }
+  ]
+}
