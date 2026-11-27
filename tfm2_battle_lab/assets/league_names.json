@@ -1,0 +1,178 @@
+{
+"#asset/base/text/ui?league.tack": {
+"ko": "한국 1부",
+"en": "KR Div 1"
+},
+"한국 1부": {
+"ko": "한국 1부",
+"en": "KR Div 1"
+},
+"한국 1부 리그": {
+"ko": "한국 1부",
+"en": "KR Div 1"
+},
+"#asset/base/text/ui?league.tacc": {
+"ko": "중국 1부",
+"en": "CN Div 1"
+},
+"중국 1부": {
+"ko": "중국 1부",
+"en": "CN Div 1"
+},
+"중국 1부 리그": {
+"ko": "중국 1부",
+"en": "CN Div 1"
+},
+"#asset/base/text/ui?league.tace": {
+"ko": "유럽 1부",
+"en": "EU Div 1"
+},
+"유럽 1부": {
+"ko": "유럽 1부",
+"en": "EU Div 1"
+},
+"유럽 1부 리그": {
+"ko": "유럽 1부",
+"en": "EU Div 1"
+},
+"#asset/base/text/ui?league.taca": {
+"ko": "미국 1부",
+"en": "NA Div 1"
+},
+"미국 1부": {
+"ko": "미국 1부",
+"en": "NA Div 1"
+},
+"미국 1부 리그": {
+"ko": "미국 1부",
+"en": "NA Div 1"
+},
+"#asset/base/text/ui?league.tacs": {
+"ko": "남미 1부",
+"en": "SA Div 1"
+},
+"남미 1부": {
+"ko": "남미 1부",
+"en": "SA Div 1"
+},
+"남미 1부 리그": {
+"ko": "남미 1부",
+"en": "SA Div 1"
+},
+"#asset/base/text/ui?league.tacj": {
+"ko": "일본 1부",
+"en": "JP Div 1"
+},
+"일본 1부": {
+"ko": "일본 1부",
+"en": "JP Div 1"
+},
+"일본 1부 리그": {
+"ko": "일본 1부",
+"en": "JP Div 1"
+},
+"#asset/base/text/ui?league.tack2": {
+"ko": "한국 2부",
+"en": "KR Div 2"
+},
+"한국 2부": {
+"ko": "한국 2부",
+"en": "KR Div 2"
+},
+"한국 2부 리그": {
+"ko": "한국 2부",
+"en": "KR Div 2"
+},
+"#asset/base/text/ui?league.tacc2": {
+"ko": "중국 2부",
+"en": "CN Div 2"
+},
+"중국 2부": {
+"ko": "중국 2부",
+"en": "CN Div 2"
+},
+"중국 2부 리그": {
+"ko": "중국 2부",
+"en": "CN Div 2"
+},
+"#asset/base/text/ui?league.tace2": {
+"ko": "유럽 2부",
+"en": "EU Div 2"
+},
+"유럽 2부": {
+"ko": "유럽 2부",
+"en": "EU Div 2"
+},
+"유럽 2부 리그": {
+"ko": "유럽 2부",
+"en": "EU Div 2"
+},
+"#asset/base/text/ui?league.taca2": {
+"ko": "북미 2부",
+"en": "NA Div 2"
+},
+"북미 2부": {
+"ko": "북미 2부",
+"en": "NA Div 2"
+},
+"북미 2부 리그": {
+"ko": "북미 2부",
+"en": "NA Div 2"
+},
+"#asset/base/text/ui?league.tacs2": {
+"ko": "남미 2부",
+"en": "SA Div 2"
+},
+"남미 2부": {
+"ko": "남미 2부",
+"en": "SA Div 2"
+},
+"남미 2부 리그": {
+"ko": "남미 2부",
+"en": "SA Div 2"
+},
+"#asset/base/text/ui?league.tacj2": {
+"ko": "일본 2부",
+"en": "JP Div 2"
+},
+"일본 2부": {
+"ko": "일본 2부",
+"en": "JP Div 2"
+},
+"일본 2부 리그": {
+"ko": "일본 2부",
+"en": "JP Div 2"
+},
+"#asset/base/text/ui?tournament.masters": {
+"ko": "마스터즈 컵",
+"en": "Masters Cup"
+},
+"마스터즈 컵": {
+"ko": "마스터즈 컵",
+"en": "Masters Cup"
+},
+"#asset/base/text/ui?tournament.champions": {
+"ko": "챔피언스 컵",
+"en": "Champions Cup"
+},
+"챔피언스 컵": {
+"ko": "챔피언스 컵",
+"en": "Champions Cup"
+},
+"#asset/base/text/ui?tournament.challengers_east": {
+"ko": "챌린저스 컵 이스턴",
+"en": "Challengers Cup Eastern"
+},
+"챌린저스 컵 이스턴": {
+"ko": "챌린저스 컵 이스턴",
+"en": "Challengers Cup Eastern"
+},
+"#asset/base/text/ui?tournament.challengers_west": {
+"ko": "챌린저스 컵 웨스턴",
+"en": "Challengers Cup Western"
+},
+"챌린저스 컵 웨스턴": {
+"ko": "챌린저스 컵 웨스턴",
+"en": "Challengers Cup Western"
+}
+}

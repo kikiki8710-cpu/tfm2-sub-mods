@@ -1,0 +1,6 @@
+{
+  "asset/base/text/ui": {
+    "remapping": "asset/daram2_view_plus/text/view_plus",
+    "type": "merge"
+  }
+}

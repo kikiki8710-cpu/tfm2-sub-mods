@@ -1,0 +1,7 @@
+{
+  "en": {
+    "serpen": {
+      "current_buff": "Current cumulative effect (x{Count}): {Stats}"
+    }
+  }
+}

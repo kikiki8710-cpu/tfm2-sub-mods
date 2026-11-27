@@ -1,0 +1,540 @@
+//! training_view_plus v0.6.0 — 개인 훈련 계획 "챔피언 훈련 일괄" (daram2 0.5.2 클래식의 0.6.0 stable 껍데기 재작성, 2026-09-18)
+//! ===========================================================================
+//! 기능: 훈련 화면에 버튼 → 패널(탑/정글/미드/바텀/서포터 × 역할군 풀다운 · 매일 자동 재적용) → 적용 시 해당 포지션 선수 전원의
+//!   훈련 챔피언을 그 역할군 상위 티어 4개(각 25%)로 설정. '팀 훈련 따름' = 그 포지션 선수의 개인 설정 삭제. '변경 안 함' = 그대로.
+//! 구조: 클라 = stable UI(ui_spawn_source · 공용 dropdown_stable) + `send_command("tvp_apply")` / 서버 = `handle_command` 에서 티어(team champion_tiers)·
+//!   선수(포지션·계약)·챔피언 역할군(클라가 payload 로 전달)으로 목록을 만들고 `ui_kit\training_plan_stable.rs`(0.6.0 RE 경로 B: Database 훈련계획 직접 쓰기 + ResponseTrainingPlan 유니캐스트).
+//! 근거 RE = `mods_report/daram2_view_plus/RE/2026-09-18_0.6.0-훈련계획-TeamTrainingPlan-저장처-응답경로.md`.
+//! 파일: <게임>\mods\training_view_plus\training_view_plus.cfg(pos0..4=역할군 idx · auto=0/1) · tvp_log.txt(DBG).
+//! 문구(★0.7.2 i18n 11-11): 화면 문구 전부 = `text/tvp.i18n`(mod.override_info 로 asset/base/text/ui 에 merge · 게임 17개 언어 블록, ko 외 = 영어).
+//!   서버 결과는 `TVP1\t…` 구조로 보내고 클라가 그 i18n 으로 문구를 만든다(server_text). ⟹ **배포 시 text/tvp.i18n 도 같이 갱신**(dll 만 바꾸면 새 키가 없어 키 이름이 보인다).
+//! ===========================================================================
+#![cfg_attr(feature = "embedded", allow(dead_code, unused_imports))] // 통합판 빌드: init·declare_stable_mod 미사용
+use mod_api_stable::{declare_stable_mod, ClientSceneKindV1, CommandResultV1, LogLevel, RecordKindV1, StableClient, StableCommand, StableExtension, StableHost, StableMod, StableServerCtx, StableServerExtension};
+use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
+
+#[path = "../../../../ui_kit/dropdown_stable.rs"]
+mod dd;
+#[path = "../../../../ui_kit/training_plan_stable.rs"]
+mod training_plan;
+#[path = "../../../../common/log_dir.rs"]
+mod log_dir; // ★10-21: 로그 폴더(`mods\_log_root.txt` 있으면 그 아래) — tvp_log.txt 만. .cfg 는 모드 폴더 그대로
+
+const MOD_ID: &str = "training_view_plus";
+const DBG: bool = false; // 진단 시 true(tvp_log.txt)
+const CMD: &str = "tvp_apply";
+const EVT: &str = "tvp_result";
+const VIEW: &str = "main.top.right"; // ★09-19: training 뷰 안(루트·panel)에 스폰하면 클릭이 우리 핸들러에 안 오고 뷰가 재생성됨(실측) → 뷰 형제 레벨(main.top.right)에 스폰하고 training 이 보일 때만 표시
+const VIEW_ROOT: &str = "main.top.right.training";
+const BTN_PARENT: &str = "main.top.right"; // ★0.6.2(09-30): ~~main.top.right.training.tabs~~ — 0.6.2 에서 게임 tabs 컨테이너 안 모드 버튼에 클릭이 안 온다(DBG 실측: register=true·클릭 0건) → 패널과 같은 형제 레벨로 이동, 우측 앵커로 기존 자리 재현
+const BTN: &str = "tvp_open";
+const PANEL: &str = "tvp_panel";
+const I18N: &str = "#asset/base/text/ui?training_view_plus.";
+const POS_KEYS: [&str; 5] = ["line_top", "line_jungle", "line_mid", "line_bottom", "line_support"];
+/// 역할 인덱스 r(≥2) ↔ ChampionCategoryV1 코드 r-2. ★0.7.3(ABI 11): `role_tank`(r=7 ↔ 코드 5 Tank) 추가 — 끝에 붙여 저장된 cfg 인덱스 0~6 은 그대로.
+const ROLE_KEYS: [&str; 8] = ["role_keep", "role_team", "role_melee", "role_range", "role_magician", "role_util", "role_assassin", "role_tank"];
+const ROLE_IDS: [&str; 8] = ["r_keep", "r_team", "r_melee", "r_range", "r_magician", "r_util", "r_assassin", "r_tank"];
+const PANEL_X: i32 = 400; const PANEL_Y: i32 = 110; const PANEL_W: i32 = 640; const PANEL_H: i32 = 570;
+const AUTO_ON_COLOR: &str = "#37d5b3ff"; const AUTO_OFF_COLOR: &str = "#e8e8e8ff";
+/// 적용 버튼을 다시 눌러도 결과 문구가 같으면 반응이 없어 보인다 → 「적용 중…」을 최소 이만큼 보인 뒤 결과로 바꾼다.
+const APPLY_MIN_SHOW: std::time::Duration = std::time::Duration::from_millis(600);
+const ROW_Y0: i32 = 150; const ROW_H: i32 = 46; const DD_X: i32 = 180; const DD_W: i32 = 220; const DD_H: i32 = 36;
+
+#[link(name = "kernel32")]
+extern "system" { fn GetModuleFileNameW(h: usize, buf: *mut u16, n: u32) -> u32; }
+#[cfg(not(feature = "embedded"))]
+fn mod_dir() -> Option<String> {
+    let mut buf = [0u16; 512];
+    let n = unsafe { GetModuleFileNameW(0, buf.as_mut_ptr(), 512) } as usize;
+    if n == 0 || n >= 512 { return None; }
+    let exe = String::from_utf16_lossy(&buf[..n]);
+    Some(format!("{}\\mods\\{}", std::path::Path::new(&exe).parent()?.display(), MOD_ID))
+}
+/// 통합판(daram2_view_plus · feature "embedded"): 모드 폴더 = 통합판 dll 폴더(`embedded::init` 이 넘겨준 값).
+///   파일 이름(training_view_plus.cfg·tvp_log.txt·tvp_diag.flag)은 이미 모듈 고유라 그대로.
+#[cfg(feature = "embedded")]
+fn mod_dir() -> Option<String> { embedded::dir() }
+/// 서버 이벤트 — 단독판 = 이 모드 큐를 직접 비운다. 통합판은 큐가 7개 모듈 공용이라 통합판이 한 번 비워 나눠 준 것(`embedded::feed_events`)을 받는다.
+#[cfg(not(feature = "embedded"))]
+fn take_events(ctx: &mut StableClient<'_>) -> Vec<mod_api_stable::StableModEvent> { ctx.take_events() }
+#[cfg(feature = "embedded")]
+fn take_events(_ctx: &mut StableClient<'_>) -> Vec<mod_api_stable::StableModEvent> { embedded::take_events() }
+/// ★11-04: `mods\training_view_plus\tvp_diag.flag` 가 있으면 DBG 빌드가 아니어도 tvp_log.txt 를 남긴다(배포 dll 로 현장 진단).
+static DIAG: AtomicBool = AtomicBool::new(false);
+fn log(s: &str) {
+    if !DBG && !DIAG.load(Ordering::Relaxed) { return; }
+    if let Some(d) = mod_dir() { use std::io::Write; let d = log_dir::log_dir(&d); let _ = std::fs::create_dir_all(&d); let _ = std::fs::OpenOptions::new().append(true).create(true).open(format!("{d}\\tvp_log.txt")).and_then(|mut f| writeln!(f, "[f{}] {}", FRAME.load(Ordering::Relaxed), s)); }
+}
+
+// ── 설정(영속) ──
+static ROLES: Mutex<[usize; 5]> = Mutex::new([0; 5]);
+static AUTO: AtomicBool = AtomicBool::new(false);
+static CFG_LOADED: AtomicBool = AtomicBool::new(false);
+fn cfg_load() {
+    if CFG_LOADED.swap(true, Ordering::Relaxed) { return; }
+    let Some(d) = mod_dir() else { return };
+    DIAG.store(std::path::Path::new(&format!("{d}\\tvp_diag.flag")).exists(), Ordering::Relaxed);
+    let Ok(t) = std::fs::read_to_string(format!("{d}\\{MOD_ID}.cfg")) else { return };
+    let mut r = ROLES.lock().unwrap_or_else(|e| e.into_inner());
+    for line in t.lines() {
+        let Some((k, v)) = line.split_once('=') else { continue };
+        let (k, v) = (k.trim(), v.trim());
+        if let Some(i) = k.strip_prefix("pos").and_then(|x| x.parse::<usize>().ok()) { if i < 5 { r[i] = v.parse::<usize>().unwrap_or(0).min(ROLE_IDS.len() - 1); } }
+        if k == "auto" { AUTO.store(v == "1", Ordering::Relaxed); }
+    }
+}
+fn cfg_save() {
+    let Some(d) = mod_dir() else { return };
+    let r = *ROLES.lock().unwrap_or_else(|e| e.into_inner());
+    let mut s = String::from("# training_view_plus — 포지션별 역할군(0=변경 안 함 1=팀 훈련 따름 2=전사 3=원거리 4=마법사 5=전투보조 6=암살자 7=탱커) · auto=매일 자동 재적용\n");
+    for i in 0..5 { s.push_str(&format!("pos{}={}\n", i, r[i])); }
+    s.push_str(&format!("auto={}\n", if AUTO.load(Ordering::Relaxed) { 1 } else { 0 }));
+    let _ = std::fs::create_dir_all(&d);
+    let _ = std::fs::write(format!("{d}\\{MOD_ID}.cfg"), s);
+}
+
+// ── 클라 상태 ──
+static FRAME: AtomicU64 = AtomicU64::new(0);
+static ACTIVE: AtomicBool = AtomicBool::new(false);
+static PANEL_OPEN: AtomicBool = AtomicBool::new(false);
+static DD_OPEN: [AtomicBool; 5] = [AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false)];
+static CLICKS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static LAST_CLICK: Mutex<Option<(u64, String)>> = Mutex::new(None);
+static APPLY_REQ: AtomicBool = AtomicBool::new(false);
+static LAST_DAY: AtomicI64 = AtomicI64::new(i64::MIN);
+/// 상태줄 = 「무엇을 보일지」만 들고 있고 글자는 매번 지금 언어로 만든다(게임 중 언어를 바꿔도 따라감 · ★0.7.2 i18n 11-11).
+#[derive(Clone, PartialEq)]
+enum Status { Key(&'static str), Server(String) }
+static STATUS: Mutex<Option<Status>> = Mutex::new(None);
+static SPAWN_FAIL: AtomicUsize = AtomicUsize::new(0);
+static HAD_PANEL: AtomicBool = AtomicBool::new(false);
+static APPLY_AT: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+static PENDING_RESULT: Mutex<Option<String>> = Mutex::new(None);
+
+fn push_click(s: &str) { CLICKS.lock().unwrap_or_else(|e| e.into_inner()).push(s.to_string()); }
+fn t(ctx: &StableClient<'_>, k: &str) -> String { ctx.i18n(&format!("{}{}", I18N, k)).unwrap_or_else(|| k.to_string()) }
+
+// ── 언어(★0.7.2 i18n 11-11) ── 화면 문구는 `text/tvp.i18n`(게임 언어별 블록)이 정한다. 여기선 ①언어가 바뀐 것을 알아채 스폰 노드를
+//   새로 만들고 ②서버가 넘긴 ui_kit 실패 이유(한국어)를 비-한국어일 때 영어로 바꾸는 데만 쓴다. 판정 = custom_tier 방식(게임 샘플 키에 한글이 있나).
+const LANG_SAMPLE_KEY: &str = "#asset/base/text/ui?main.champion_info.reset_tier";
+static LANG_KO: AtomicBool = AtomicBool::new(true);
+static LANG_SAMPLE: Mutex<String> = Mutex::new(String::new());
+fn has_hangul(s: &str) -> bool { s.chars().any(|c| ('\u{ac00}'..='\u{d7a3}').contains(&c)) }
+/// 게임 언어 판정(빈 값이면 직전 판정 유지 — 시작값 = ko). 샘플이 바뀌었으면(=게임 언어 변경) true.
+fn lang_tick(ctx: &StableClient<'_>) -> bool {
+    let s = ctx.i18n(LANG_SAMPLE_KEY).unwrap_or_default();
+    if s.is_empty() { return false; }
+    LANG_KO.store(has_hangul(&s), Ordering::Relaxed);
+    let mut g = LANG_SAMPLE.lock().unwrap_or_else(|e| e.into_inner());
+    if *g == s { return false; }
+    let first = g.is_empty();
+    *g = s;
+    !first
+}
+/// 서버 결과 이벤트 = `TVP1\t<종류>\t…`(문구는 클라가 i18n 으로 만든다 — 서버엔 i18n 이 없다). 모르는 형식이면 받은 그대로.
+const RES_TAG: &str = "TVP1";
+fn fill(tpl: String, args: &[(&str, &str)]) -> String { let mut s = tpl; for (k, v) in args { s = s.replace(&format!("{{{}}}", k), v); } s }
+fn server_text(ctx: &StableClient<'_>, m: &str) -> String { server_text_with(|k| t(ctx, k), LANG_KO.load(Ordering::Relaxed), m) }
+/// 결과 문구 6키의 내장 사본 — 배포된 tvp.i18n 이 옛판(새 키 없음)이면 i18n 이 키 이름을 돌려주므로 이걸 쓴다(값 = tvp.i18n ko/en 과 같음 · 테스트로 대조).
+fn builtin(k: &str, ko: bool) -> Option<&'static str> {
+    Some(match k {
+        "err_no_team" => if ko { "오류: 팀 id 없음" } else { "Error: no team id" },
+        "err_panic" => if ko { "오류: 서버 처리 중 패닉" } else { "Error: server panic while processing" },
+        "error" => if ko { "오류: {reason}" } else { "Error: {reason}" },
+        "result_none" => if ko { "변경 없음(대상 선수 0 · 포지션 미확인 {nopos})" } else { "No changes (0 target players · {nopos} no position)" },
+        "result_ok" => if ko { "적용 완료: 설정 {set}명 · 팀 훈련 따름 {clear}명" } else { "Applied: {set} set · {clear} follow team" },
+        "result_ok_nopos" => if ko { "적용 완료: 설정 {set}명 · 팀 훈련 따름 {clear}명 (포지션 미확인 {nopos}명 제외)" } else { "Applied: {set} set · {clear} follow team ({nopos} skipped, no position)" },
+        _ => return None,
+    })
+}
+/// `tr` = i18n 키 → 문구(테스트에선 tvp.i18n 블록을 직접 읽는다).
+fn server_text_with(tr: impl Fn(&str) -> String, ko: bool, m: &str) -> String {
+    // 키 없음 = None→키 이름(t 의 폴백) · 빈 값 · 경로 그대로(`#asset/…`) 중 무엇이 와도 내장 사본으로
+    let tr = |k: &str| { let s = tr(k); if s == k || s.is_empty() || s.starts_with('#') { builtin(k, ko).map(|b| b.to_string()).unwrap_or(s) } else { s } };
+    let f: Vec<&str> = m.split('\t').collect();
+    if f.first() != Some(&RES_TAG) { return m.to_string(); }
+    match &f[1..] {
+        ["no_team"] => tr("err_no_team"),
+        ["panic"] => tr("err_panic"),
+        ["none", nopos] => fill(tr("result_none"), &[("nopos", *nopos)]),
+        ["ok", set, clear, nopos] => {
+            let key = if nopos.parse::<usize>().unwrap_or(0) > 0 { "result_ok_nopos" } else { "result_ok" };
+            fill(tr(key), &[("set", *set), ("clear", *clear), ("nopos", *nopos)])
+        }
+        ["fail", reason @ ..] => {
+            let r = reason.join("\t");
+            let r = if ko { r } else { training_plan::reason_en(&r) };
+            fill(tr("error"), &[("reason", &r)])
+        }
+        _ => m.to_string(),
+    }
+}
+fn status_text(ctx: &StableClient<'_>, s: &Status) -> String { match s { Status::Key(k) => t(ctx, k), Status::Server(m) => server_text(ctx, m) } }
+
+fn panel_source() -> String {
+    let mut s = format!(
+"#{PANEL}:color {{ visible: false; x: {PANEL_X}px; y: {PANEL_Y}px; width: {PANEL_W}px; height: {PANEL_H}px; color: #4a4c56ff; stroke: 1; back_color: #161721ff; rounding: Uniform {{ rounding: 12; }}
+  #title:label {{ @\"asset/base/style/main#bold_label\"; ignore_event: true; x: 24px; y: 18px; width: 580px; height: 36px; size: 22; align_y: Center; text: \"{I18N}title\"; }}
+  #desc:label {{ @\"asset/base/style/main#label\"; ignore_event: true; x: 24px; y: 58px; width: 592px; height: 80px; size: 14; line_height: 20; color: #a3a9b6ff; align_y: Center; text: \"{I18N}desc\"; }}
+  #close_x:color_icon_button {{ @\"asset/base/style/main#tertiary_button\"; anchor_x: 1; pivot_x: 1; x: -20px; y: 18px; width: 36px; height: 36px; icon: {{ source: \"asset/base/ui/icons/cross\"; rect: {{ x: 10; y: 10; w: 16; h: 16; }} }} }}
+");
+    for i in 0..5 {
+        let y = ROW_Y0 + i as i32 * ROW_H;
+        s.push_str(&format!("  #pos{i}:label {{ @\"asset/base/style/main#bold_label\"; ignore_event: true; x: 32px; y: {y}px; width: 130px; height: {DD_H}px; size: 17; align_y: Center; text: \"{I18N}{}\"; }}\n", POS_KEYS[i]));
+        s.push_str(&dd::button_source(&format!("dd{i}"), DD_X, y, DD_W, DD_H, &format!("{I18N}role_keep"), 15).replace("\n#", "\n  #"));
+    }
+    let ya = ROW_Y0 + 5 * ROW_H + 8;
+    s.push_str(&format!("  #auto_l:label {{ @\"asset/base/style/main#bold_label\"; ignore_event: true; x: 32px; y: {ya}px; width: 144px; height: 34px; size: 16; align_y: Center; text: \"{I18N}auto\"; }}\n"));
+    // ★11-04: ~~`text: { … }`(버튼 자체 글자)~~ — `ui_set_text` 로 안 바뀌어 눌러도(auto=1 저장됨) 「끔」 그대로 보였다(서브 PC 실측 · 0.7.0).
+    //   ⟹ 풀다운 버튼과 같은 자식 라벨 방식(`.label` 은 ui_set_text 로 바뀐다).
+    s.push_str(&format!("  #auto_b:color_icon_button {{ @\"asset/base/style/main#tertiary_button\"; x: {DD_X}px; y: {ya}px; width: 100px; height: 34px;\n    #label:label {{ ignore_event: true; width: 100px; height: 34px; font: \"asset/base/font/set/bold\"; size: 15; color: {AUTO_OFF_COLOR}; align_x: Center; align_y: Center; text: \"{I18N}off\"; }}\n  }}\n"));
+    s.push_str(&format!("  #note:label {{ @\"asset/base/style/main#label\"; ignore_event: true; x: 24px; y: {}px; width: 592px; height: 44px; size: 13; line_height: 18; color: #858d9dff; align_y: Center; text: \"{I18N}note\"; }}\n", ya + 40));
+    s.push_str(&format!("  #status:label {{ @\"asset/base/style/main#label\"; ignore_event: true; x: 24px; y: {}px; width: 592px; height: 24px; size: 14; color: #37d5b3ff; align_y: Center; text: \"\"; }}\n", PANEL_H - 78));
+    s.push_str(&format!("  #apply:color_icon_button {{ @\"asset/base/style/main#primary_button\"; x: {}px; y: {}px; width: 180px; height: 40px; text: {{ text: \"{I18N}apply\"; font: \"asset/base/font/set/bold\"; size: 17; align_x: Center; align_y: Center; }} }}\n", PANEL_W - 24 - 180 - 12 - 140, PANEL_H - 52));
+    s.push_str(&format!("  #close:color_icon_button {{ @\"asset/base/style/main#tertiary_button\"; x: {}px; y: {}px; width: 140px; height: 40px; text: {{ text: \"{I18N}close\"; font: \"asset/base/font/set/bold\"; size: 17; align_x: Center; align_y: Center; }} }}\n", PANEL_W - 24 - 140, PANEL_H - 52));
+    s.push_str("}\n");
+    s
+}
+fn list_source(i: usize) -> String {
+    let items: Vec<(String, String)> = ROLE_IDS.iter().zip(ROLE_KEYS.iter()).map(|(id, k)| (id.to_string(), format!("{I18N}{k}"))).collect();
+    let refs: Vec<(&str, &str)> = items.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    dd::list_source(&format!("dl{i}"), PANEL_X + DD_X, PANEL_Y + ROW_Y0 + i as i32 * ROW_H + DD_H + dd::LIST_GAP as i32, DD_W, 34, 15, &refs)
+}
+fn btn_source() -> String {
+    format!("#{BTN}:color_icon_button {{ @\"asset/base/style/main#secondary_button\"; anchor_x: 1; pivot_x: 1; x: -265px; y: 29px; width: 180px; height: 31px; text: {{ font: \"asset/base/font/set/bold\"; text: \"{I18N}open_btn\"; size: 14; align_x: Center; align_y: Center; }} }}")
+}
+
+fn register(ctx: &mut StableClient<'_>) {
+    let p = format!("{VIEW}.{PANEL}");
+    let okb = ctx.ui_register_click(&format!("{BTN_PARENT}.{BTN}"), "", |_| push_click("open"));
+    log(&format!("register open btn → {}", okb));
+    for k in ["close_x", "close", "apply", "auto_b"] { let kk: &'static str = k; ctx.ui_register_click(&format!("{p}.{k}"), "", move |_| push_click(kk)); }
+    for i in 0..5 {
+        let tag = format!("dd{i}"); ctx.ui_register_click(&format!("{p}.dd{i}"), "", move |_| push_click(&tag));
+        for (j, rid) in ROLE_IDS.iter().enumerate() { let tag = format!("sel{i}_{j}"); ctx.ui_register_click(&format!("{VIEW}.dl{i}.{rid}"), "", move |_| push_click(&tag)); }
+    }
+}
+
+fn set_status(s: Status) { *STATUS.lock().unwrap_or_else(|e| e.into_inner()) = Some(s); }
+
+/// 적용 payload: roles + 챔피언 역할군 표(서버엔 champion_brief 가 없음).
+fn build_payload(ctx: &StableClient<'_>) -> String {
+    let r = *ROLES.lock().unwrap_or_else(|e| e.into_inner());
+    let mut p = format!("roles\t{},{},{},{},{}\n", r[0], r[1], r[2], r[3], r[4]);
+    for id in ctx.champion_names() {
+        let cat = ctx.champion_brief(&id).and_then(|b| b.category).map(|c| c as i64).unwrap_or(-1);
+        p.push_str(&format!("c\t{}\t{}\n", id, cat));
+    }
+    p
+}
+
+fn tick(ctx: &mut StableClient<'_>) {
+    let f = FRAME.fetch_add(1, Ordering::Relaxed);
+    cfg_load();
+    for ev in take_events(ctx) { if ev.event == EVT { let m = String::from_utf8_lossy(&ev.payload).to_string(); log(&format!("서버 응답: {}", m)); *PENDING_RESULT.lock().unwrap_or_else(|e| e.into_inner()) = Some(m); } }
+    {
+        let shown = APPLY_AT.lock().unwrap_or_else(|e| e.into_inner()).map(|t0| t0.elapsed() >= APPLY_MIN_SHOW).unwrap_or(true);
+        if shown { if let Some(m) = PENDING_RESULT.lock().unwrap_or_else(|e| e.into_inner()).take() { set_status(Status::Server(m)); } }
+    }
+    if ctx.client_scene_kind() != Some(ClientSceneKindV1::Main) { if ACTIVE.swap(false, Ordering::Relaxed) { PANEL_OPEN.store(false, Ordering::Relaxed); } return; }
+    // ★0.7.2 i18n: 게임 언어가 바뀌면 스폰 노드(문구가 스폰 시점 언어로 박힘)를 지워 아래 재스폰 경로가 새 언어로 다시 만들게 한다.
+    if f % 30 == 0 && lang_tick(ctx) {
+        log("게임 언어 변경 → 버튼·패널 재스폰");
+        for n in [format!("{BTN_PARENT}.{BTN}"), format!("{VIEW}.{PANEL}")].into_iter().chain((0..5).map(|i| format!("{VIEW}.dl{i}"))) { if ctx.ui_exists(&n) { ctx.ui_remove_node(&n); } }
+        for d in &DD_OPEN { d.store(false, Ordering::Relaxed); }
+        HAD_PANEL.store(false, Ordering::Relaxed);
+    }
+    // 매일 자동
+    if let (Some((y, m, d)), true) = (ctx.game_date(), ctx.ui_exists("main.top.right")) {
+        let today = y as i64 * 10000 + m as i64 * 100 + d as i64;
+        let prev = LAST_DAY.swap(today, Ordering::Relaxed);
+        if prev != i64::MIN && prev != today && AUTO.load(Ordering::Relaxed) { APPLY_REQ.store(true, Ordering::Relaxed); log("날짜 변경 → 자동 재적용"); }
+    }
+    if APPLY_REQ.swap(false, Ordering::Relaxed) {
+        let p = build_payload(ctx);
+        let ok = ctx.send_command(CMD, p.as_bytes());
+        log(&format!("send_command {} ({}B) → {}", CMD, p.len(), ok));
+        set_status(Status::Key("applying"));
+        *APPLY_AT.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
+    }
+    if f % 3 != 0 { return; }
+    let vis = ctx.ui_exists(VIEW) && ctx.ui_visible(VIEW_ROOT).unwrap_or(false);
+    let bpath = format!("{BTN_PARENT}.{BTN}");
+    if !vis { if ACTIVE.swap(false, Ordering::Relaxed) { PANEL_OPEN.store(false, Ordering::Relaxed); for d in &DD_OPEN { d.store(false, Ordering::Relaxed); } }
+        if ctx.ui_exists(&bpath) && ctx.ui_visible(&bpath) != Some(false) { ctx.ui_set_visible(&bpath, false); }
+        let pp = format!("{VIEW}.{PANEL}"); if ctx.ui_exists(&pp) && ctx.ui_visible(&pp) != Some(false) { ctx.ui_set_visible(&pp, false); }
+        for i in 0..5 { let l = format!("{VIEW}.dl{i}"); if ctx.ui_exists(&l) && ctx.ui_visible(&l) != Some(false) { ctx.ui_set_visible(&l, false); } }
+        return; }
+    if ctx.ui_exists(&bpath) && ctx.ui_visible(&bpath) != Some(true) { ctx.ui_set_visible(&bpath, true); }
+    let p = format!("{VIEW}.{PANEL}");
+    { let now = ctx.ui_exists(&p); let was = HAD_PANEL.swap(now, Ordering::Relaxed); if was && !now { log(&format!("★노드 소실 f{} kids={:?} edge={}", f, ctx.ui_child_names(VIEW), dd::click_edge())); } }
+    if !ctx.ui_exists(&p) || !ctx.ui_exists(&format!("{BTN_PARENT}.{BTN}")) {
+        log(&format!("재스폰 진입: panel={} btn={} lists={:?} kids={:?}", ctx.ui_exists(&p), ctx.ui_exists(&format!("{BTN_PARENT}.{BTN}")), (0..5).map(|i| ctx.ui_exists(&format!("{VIEW}.dl{i}"))).collect::<Vec<_>>(), ctx.ui_child_names(VIEW)));
+        if SPAWN_FAIL.load(Ordering::Relaxed) > 5 { return; } // ★스폰 소스의 최상위 노드는 `#` 없이(champ_excl_popup 관례) — 09-19 실측: `#id` 로 주면 spawn false
+        let ok1 = ctx.ui_exists(&format!("{BTN_PARENT}.{BTN}")) || ctx.ui_spawn_source(BTN_PARENT, btn_source().trim_start_matches('#'));
+        let ok2 = ctx.ui_exists(&p) || ctx.ui_spawn_source(VIEW, panel_source().trim_start_matches('#'));
+        let mut ok3 = true;
+        for i in 0..5 { if !ctx.ui_exists(&format!("{VIEW}.dl{i}")) { ok3 &= ctx.ui_spawn_source(VIEW, list_source(i).trim_start_matches('#')); } }
+        log(&format!("스폰 btn={} panel={} lists={} kids={:?}", ok1, ok2, ok3, ctx.ui_child_names(VIEW)));
+        if !(ok1 && ok2 && ok3) { SPAWN_FAIL.fetch_add(1, Ordering::Relaxed); return; }
+        register(ctx); dd::reset_cache();
+        ACTIVE.store(true, Ordering::Relaxed);
+    } else if !ACTIVE.swap(true, Ordering::Relaxed) { register(ctx); dd::reset_cache(); }
+    // 클릭 처리
+    let clicks: Vec<String> = std::mem::take(&mut *CLICKS.lock().unwrap_or_else(|e| e.into_inner()));
+    for c in clicks {
+        { let mut lc = LAST_CLICK.lock().unwrap_or_else(|e| e.into_inner()); if lc.as_ref().map(|(ff, s)| *ff == f && *s == c).unwrap_or(false) { continue; } *lc = Some((f, c.clone())); }
+        match c.as_str() {
+            "open" => { PANEL_OPEN.fetch_xor(true, Ordering::Relaxed); set_status(Status::Key("status_idle")); }
+            "close" | "close_x" => { PANEL_OPEN.store(false, Ordering::Relaxed); for d in &DD_OPEN { d.store(false, Ordering::Relaxed); } }
+            "apply" => { cfg_save(); APPLY_REQ.store(true, Ordering::Relaxed); }
+            "auto_b" => { AUTO.fetch_xor(true, Ordering::Relaxed); cfg_save(); }
+            s if s.starts_with("dd") => { if let Ok(i) = s[2..].parse::<usize>() { if i < 5 { let was = DD_OPEN[i].load(Ordering::Relaxed); for d in &DD_OPEN { d.store(false, Ordering::Relaxed); } DD_OPEN[i].store(!was, Ordering::Relaxed); } } }
+            s if s.starts_with("sel") => { if let Some((a, b)) = s[3..].split_once('_') { if let (Ok(i), Ok(j)) = (a.parse::<usize>(), b.parse::<usize>()) { if i < 5 && j < ROLE_IDS.len() { ROLES.lock().unwrap_or_else(|e| e.into_inner())[i] = j; DD_OPEN[i].store(false, Ordering::Relaxed); cfg_save(); } } } }
+            _ => {}
+        }
+        log(&format!("클릭 {}", c));
+    }
+    let open = PANEL_OPEN.load(Ordering::Relaxed);
+    if ctx.ui_visible(&p) != Some(open) { ctx.ui_set_visible(&p, open); }
+    if !open { for i in 0..5 { let l = format!("{VIEW}.dl{i}"); if ctx.ui_visible(&l) == Some(true) { ctx.ui_set_visible(&l, false); } } return; }
+    let edge = dd::click_edge();
+    if edge && DIAG.load(Ordering::Relaxed) {
+        // 클릭 판정 진단: 누른 자리와 버튼 rect(1920×1080) — 클릭 핸들러가 안 오면 「클릭 …」 줄 없이 이 줄만 남는다
+        let r = |k: &str| ctx.ui_node_rect(&format!("{p}.{k}"));
+        log(&format!("edge cur={:?} auto_b={:?} apply={:?} close={:?} panel={:?}", dd::cursor_ui(), r("auto_b"), r("apply"), r("close"), ctx.ui_node_rect(&p)));
+    }
+    let roles = *ROLES.lock().unwrap_or_else(|e| e.into_inner());
+    for i in 0..5 { dd::tick(ctx, &format!("{p}.dd{i}"), &format!("{VIEW}.dl{i}"), &ROLE_IDS, &DD_OPEN[i], roles[i], &format!("{I18N}{}", ROLE_KEYS[roles[i]]), edge); }
+    let on = AUTO.load(Ordering::Relaxed);
+    let auto_txt = t(ctx, if on { "on" } else { "off" });
+    let al = format!("{p}.auto_b.label");
+    if ctx.ui_text(&al).as_deref() != Some(&auto_txt) {
+        ctx.ui_set_text(&al, &auto_txt);
+        ctx.ui_set_properties(&al, &format!("color: {};", if on { AUTO_ON_COLOR } else { AUTO_OFF_COLOR }));
+    }
+    if let Some(st) = STATUS.lock().unwrap_or_else(|e| e.into_inner()).clone() { let s = status_text(ctx, &st); if ctx.ui_text(&format!("{p}.status")).as_deref() != Some(&s) { ctx.ui_set_text(&format!("{p}.status"), &s); } }
+}
+
+struct Ext;
+impl StableExtension for Ext {
+    fn post_update(&self, ctx: &mut StableClient<'_>, _dt: u64) { let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tick(ctx))); }
+}
+
+// ───────── 서버 ─────────
+fn find_team_id(v: &Value) -> Option<i64> {
+    match v { Value::Object(m) => { if let Some(t) = m.get("team_id").and_then(|t| t.as_i64()) { return Some(t); } m.values().find_map(find_team_id) } Value::Array(a) => a.iter().find_map(find_team_id), _ => None }
+}
+fn pos_of_value(v: &Value) -> Option<usize> {
+    match v {
+        Value::String(s) => match s.to_ascii_lowercase().as_str() { "top" => Some(0), "jungle" | "jg" => Some(1), "mid" | "middle" => Some(2), "bottom" | "bot" | "adc" => Some(3), "support" | "sup" => Some(4), _ => None },
+        Value::Number(n) => n.as_u64().filter(|x| *x < 5).map(|x| x as usize),
+        Value::Object(m) => m.keys().next().and_then(|k| pos_of_value(&Value::String(k.clone()))),
+        _ => None,
+    }
+}
+/// 선수 JSON 에서 (주)포지션 — main_position 우선, 그다음 position (깊이 무관).
+fn find_position(v: &Value) -> Option<usize> {
+    fn walk(v: &Value, key: &str) -> Option<usize> {
+        match v { Value::Object(m) => { if let Some(x) = m.get(key).and_then(pos_of_value) { return Some(x); } m.values().find_map(|c| walk(c, key)) } Value::Array(a) => a.iter().find_map(|c| walk(c, key)), _ => None }
+    }
+    walk(v, "main_position").or_else(|| walk(v, "position"))
+}
+fn tier_rank(t: &str) -> usize { match t.trim().to_ascii_uppercase().as_str() { "S" => 0, "A" => 1, "B" => 2, "C" => 3, "D" => 4, _ => 5 } }
+
+fn apply_server(ctx: &mut StableServerCtx<'_>, cmd: &StableCommand<'_>) -> String {
+    let team = cmd.sender_team_id.or_else(|| cmd.sender_player_id.and_then(|p| ctx.player_team_id(p)));
+    // ★0.7.2 i18n: 결과는 `TVP1\t…` 구조로만 보내고 화면 문구(ko/en)는 클라가 tvp.i18n 으로 만든다(server_text) — 구 한국어 리터럴 = tvp.i18n ko 블록.
+    let Some(team) = team else { return format!("{RES_TAG}\tno_team") };
+    let p = String::from_utf8_lossy(cmd.payload).to_string();
+    let mut roles = [0usize; 5];
+    let mut cats: HashMap<String, i64> = HashMap::new();
+    for line in p.lines() {
+        let f: Vec<&str> = line.split('\t').collect();
+        if f.len() >= 2 && f[0] == "roles" { for (i, x) in f[1].split(',').enumerate() { if i < 5 { roles[i] = x.trim().parse().unwrap_or(0); } } }
+        if f.len() >= 3 && f[0] == "c" { cats.insert(f[1].to_string(), f[2].parse().unwrap_or(-1)); }
+    }
+    // 티어
+    let tiers: HashMap<String, usize> = ctx.team_get_json(team, "champion_tiers").and_then(|s| serde_json::from_str::<Value>(&s).ok()).and_then(|v| v.as_object().cloned())
+        .map(|m| m.iter().filter_map(|(k, v)| v.as_str().map(|t| (k.clone(), tier_rank(t)))).collect()).unwrap_or_default();
+    // 역할군별 상위 4
+    let mut per_role: [Option<String>; 8] = Default::default();
+    for r in 2..per_role.len() {
+        let cat = (r - 2) as i64;
+        let mut cand: Vec<(usize, String)> = cats.iter().filter(|(_, c)| **c == cat).map(|(n, _)| (tiers.get(n).copied().unwrap_or(5), n.clone())).collect();
+        cand.sort();
+        let top: Vec<String> = cand.into_iter().take(4).map(|(_, n)| n).collect();
+        if top.is_empty() { continue; }
+        let share = 100 / top.len();
+        per_role[r] = Some(top.iter().map(|n| format!("{}:{}", n, share)).collect::<Vec<_>>().join("|"));
+    }
+    // 포지션 = Team.last_starting[포지션 idx] = athlete id (선발 5명) · 벤치 = season_statistics[*].by_position 최다 출전 포지션 · ★0.7.0 그다음 stat 포지션 적성 최댓값 · 넷 다 없으면 제외
+    let starting: Vec<i64> = ctx.team_get_json(team, "last_starting").and_then(|s| serde_json::from_str::<Value>(&s).ok()).and_then(|v| v.as_array().map(|a| a.iter().filter_map(|x| x.as_i64()).collect())).unwrap_or_default();
+    fn pos_by_stats(root: &Value) -> Option<usize> {
+        let mut cnt = [0i64; 5];
+        fn walk(v: &Value, cnt: &mut [i64; 5]) { match v { Value::Object(m) => { if let Some(bp) = m.get("by_position").and_then(|x| x.as_object()) { for (k, x) in bp { if let Some(p) = pos_of_value(&Value::String(k.clone())) { let n = x.get("matches").and_then(|n| n.as_i64()).unwrap_or(0); cnt[p] += n.max(1); } } } for x in m.values() { walk(x, cnt); } } Value::Array(a) => for x in a { walk(x, cnt); }, _ => {} } }
+        walk(root, &mut cnt);
+        let (i, &m) = cnt.iter().enumerate().max_by_key(|(_, c)| **c)?;
+        if m > 0 { Some(i) } else { None }
+    }
+    // ★0.7.0(10-28): 4번째 출처 = AthleteStat 포지션 적성 5칸(stat.top/jungle/mid/bottom/support) 최댓값.
+    //   서브 PC 0.7.0 실측 「포지션 미확인 8」 = 8명 전원이 위 3출처 모두 실패. 0.6.5→0.7.0 에서 Team(last_starting = [Option<id>;5] → null)·
+    //   Athlete·AthleteSeasonStatistics(by_position)·Contract 직렬화는 필드·오프셋 동일(RE 2026-10-28_0.7.0-포지션미확인) — 스키마가 아니라
+    //   "그 팀이 공식 경기를 한 번도 안 치른 세이브"(last_starting 전부 null + 시즌 통계 빈 값)에서 셋 다 비는 구조적 공백이었다.
+    //   stat 5칸은 모든 선수에 항상 있고 게임 UI 주포지션 표시의 재료다(메모리 tfm2-position-proficiency-unused) — 동점이면 top→support 순 첫 칸(추정).
+    fn pos_by_aptitude(root: &Value) -> Option<usize> {
+        const K: [&str; 5] = ["top", "jungle", "mid", "bottom", "support"];
+        fn five(m: &serde_json::Map<String, Value>) -> Option<[f64; 5]> {
+            let mut a = [0f64; 5];
+            for (i, k) in K.iter().enumerate() { a[i] = m.get(*k)?.as_f64()?; }
+            Some(a)
+        }
+        fn walk(v: &Value) -> Option<[f64; 5]> {
+            match v { Value::Object(m) => five(m).or_else(|| m.values().find_map(walk)), Value::Array(a) => a.iter().find_map(walk), _ => None }
+        }
+        let a = root.get("stat").and_then(walk).or_else(|| walk(root))?;
+        let mut best = 0usize;
+        for i in 1..5 { if a[i] > a[best] { best = i; } }
+        if a[best] > 0.0 { Some(best) } else { None }
+    }
+    // 선수
+    let mut set: Vec<(u64, String)> = Vec::new();
+    let mut clear: Vec<u64> = Vec::new();
+    let mut nopos = 0;
+    let mut src = [0usize; 4]; // ★0.7.0: 출처별 집계(선발·필드·통계·적성) — DBG 로그로 다음 회귀 때 어느 출처가 죽었는지 바로 보이게
+    for id in ctx.record_ids(RecordKindV1::Athlete) {
+        let Some(c) = ctx.athlete_get_json(id, "contract").and_then(|s| serde_json::from_str::<Value>(&s).ok()) else { continue };
+        if find_team_id(&c) != Some(team as i64) { continue; }
+        let root = ctx.athlete_get_json(id, "").and_then(|s| serde_json::from_str::<Value>(&s).ok());
+        let pos = starting.iter().position(|a| *a == id as i64).filter(|p| *p < 5).map(|p| (0usize, p))
+            .or_else(|| root.as_ref().and_then(find_position).map(|p| (1, p)))
+            .or_else(|| root.as_ref().and_then(pos_by_stats).map(|p| (2, p)))
+            .or_else(|| root.as_ref().and_then(pos_by_aptitude).map(|p| (3, p)));
+        let Some((s, pos)) = pos else { nopos += 1; log(&format!("[server] 포지션 미확인 athlete={} root={}B", id, root.as_ref().map(|r| r.to_string().len()).unwrap_or(0))); continue };
+        src[s] += 1;
+        match roles[pos] {
+            0 => {}
+            1 => clear.push(id as u64),
+            r => { if let Some(v) = per_role.get(r).and_then(|x| x.as_ref()) { set.push((id as u64, v.clone())); } }
+        }
+    }
+    log(&format!("[server] team={} roles={:?} set={} clear={} nopos={} src(선발/필드/통계/적성)={:?} last_starting={:?} tiers={} cats={}", team, roles, set.len(), clear.len(), nopos, src, starting, tiers.len(), cats.len()));
+    if set.is_empty() && clear.is_empty() { return format!("{RES_TAG}\tnone\t{}", nopos); }
+    match training_plan::apply(ctx, team, &set, &clear) {
+        Ok(m) => { log(&format!("[server] {}", m)); format!("{RES_TAG}\tok\t{}\t{}\t{}", set.len(), clear.len(), nopos) }
+        Err(e) => { log(&format!("[server] 실패: {}", e)); format!("{RES_TAG}\tfail\t{}", e) }
+    }
+}
+struct Srv;
+impl StableServerExtension for Srv {
+    fn handle_command(&self, ctx: &mut StableServerCtx<'_>, cmd: &StableCommand<'_>) -> CommandResultV1 {
+        if cmd.command != CMD { return CommandResultV1::Pass; }
+        let reply = cmd.reply_target();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| apply_server(ctx, cmd)));
+        let msg = match r { Ok(m) => m, Err(_) => format!("{RES_TAG}\tpanic") };
+        ctx.emit_event(reply, EVT, msg.as_bytes());
+        CommandResultV1::Handled
+    }
+}
+
+fn init(host: &StableHost) -> StableMod {
+    host.log(LogLevel::Info, "training_view_plus v0.6.0 (stable)");
+    log("init v0.6.0");
+    let mut d = StableMod::new(MOD_ID);
+    d.set_extension(Ext);
+    d.set_server_extension(Srv);
+    d
+}
+#[cfg(not(feature = "embedded"))]
+declare_stable_mod!(init);
+
+// ───────── 통합판(daram2_view_plus) 모듈 진입 — feature "embedded" 일 때만 컴파일(단독 빌드엔 없음 · 2026-11-11) ─────────
+#[cfg(feature = "embedded")]
+pub mod embedded {
+    use super::*;
+    use mod_api_stable::StableModEvent;
+    static DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    static EVENTS: Mutex<Vec<StableModEvent>> = Mutex::new(Vec::new());
+    /// 통합판 폴더(= 단독판 `mods\training_view_plus` 자리). init 전엔 None(파일 안 씀).
+    pub(crate) fn dir() -> Option<String> { DIR.get().cloned() }
+    /// 통합판 init 에서 1회. `mod_dir` = 통합판 dll 폴더. 단독판 `init()` 과 같은 부수효과 뒤 (클라 확장, 서버 확장).
+    pub fn init(host: &StableHost, mod_dir: &str) -> (Box<dyn StableExtension>, Option<Box<dyn StableServerExtension>>) {
+        let _ = DIR.set(mod_dir.to_string());
+        host.log(LogLevel::Info, "training_view_plus v0.6.0 (stable · daram2_view_plus module)");
+        log("init v0.6.0 (embedded)");
+        (Box::new(Ext), Some(Box::new(Srv)))
+    }
+    /// 통합판이 매 프레임 비운 서버 이벤트 전부 — 이 모듈 것(`tvp_result`)만 남겨 다음 `take_events` 때 넘긴다.
+    pub fn feed_events(evs: &[StableModEvent]) {
+        let mut q = EVENTS.lock().unwrap_or_else(|e| e.into_inner());
+        q.extend(evs.iter().filter(|e| e.event == EVT).cloned());
+    }
+    pub(crate) fn take_events() -> Vec<StableModEvent> { std::mem::take(&mut *EVENTS.lock().unwrap_or_else(|e| e.into_inner())) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    const LANGS: [&str; 17] = ["ko", "en", "ja", "de", "vi", "pt-BR", "tr", "nl", "ru", "es-ES", "fr", "it", "zh-hans", "zh-hant", "pl", "th", "haw"];
+    fn i18n() -> Value { serde_json::from_str(include_str!("../text/tvp.i18n")).expect("tvp.i18n JSON") }
+    fn tr(lang: &str) -> impl Fn(&str) -> String { let v = i18n(); let lang = lang.to_string(); move |k: &str| v[&lang]["training_view_plus"][k].as_str().map(|s| s.to_string()).unwrap_or_else(|| k.to_string()) }
+    /// 한국어 화면 문구가 i18n 이관 전 서버 리터럴과 바이트까지 같은지.
+    #[test]
+    fn ko_identical_to_old_literals() {
+        let ko = tr("ko");
+        for (set, clear, nopos) in [(5usize, 3usize, 0usize), (1, 0, 2), (0, 7, 11), (12, 12, 1)] {
+            let old = format!("적용 완료: 설정 {}명 · 팀 훈련 따름 {}명{}", set, clear, if nopos > 0 { format!(" (포지션 미확인 {}명 제외)", nopos) } else { String::new() });
+            assert_eq!(server_text_with(&ko, true, &format!("{RES_TAG}\tok\t{set}\t{clear}\t{nopos}")), old);
+        }
+        for nopos in [0usize, 4] { assert_eq!(server_text_with(&ko, true, &format!("{RES_TAG}\tnone\t{nopos}")), format!("변경 없음(대상 선수 0 · 포지션 미확인 {})", nopos)); }
+        assert_eq!(server_text_with(&ko, true, &format!("{RES_TAG}\tno_team")), "오류: 팀 id 없음");
+        assert_eq!(server_text_with(&ko, true, &format!("{RES_TAG}\tpanic")), "오류: 서버 처리 중 패닉");
+        let e = "가드① 실패: loop+state_off=Some(0)";
+        assert_eq!(server_text_with(&ko, true, &format!("{RES_TAG}\tfail\t{e}")), format!("오류: {}", e));
+    }
+    /// 17개 언어 블록이 다 있고, ko 외 블록에 한글이 없고, 키가 ko 와 같은지.
+    #[test]
+    fn all_lang_blocks_complete() {
+        let v = i18n();
+        let ko = v["ko"]["training_view_plus"].as_object().unwrap().clone();
+        for l in LANGS {
+            let b = v[l]["training_view_plus"].as_object().unwrap_or_else(|| panic!("{l} 블록 없음"));
+            for k in ko.keys() { assert!(b.contains_key(k), "{l}.{k} 없음"); }
+            if l != "ko" { for (k, s) in b { assert!(!has_hangul(s.as_str().unwrap()), "{l}.{k} 에 한글: {s}"); } }
+        }
+    }
+    /// 영어 게임: ui_kit 실패 이유를 포함한 서버 결과 전부 한글 0.
+    #[test]
+    fn en_server_text_has_no_hangul() {
+        let en = tr("en");
+        let reasons = [
+            "ctx raw 읽기 불가", "ctx.state 읽기 불가", "host_state 읽기 불가", "state 읽기 불가", "server 읽기 불가",
+            "state/server 이상 db=0x0 server=0x10", "가드① 실패: loop+state_off=Some(5)", "가드② 실패: sender.kind=Some(9)", "송신자 addr 읽기 불가", "module base 0",
+            "clone 코드 읽기 불가", "가드③ 실패: insert 진입 [55, 41, 57] ≠ 기대 (RVA stale?)", "가드③ 실패: drop_res", "센티널 읽기 불가", "센티널 노드 읽기 불가",
+            "센티널 prev 읽기 불가", "노드 0x1234 읽기 불가", "노드 prev 읽기 불가", "team 3 의 훈련 계획 노드 없음(순회 17)", "HeapAlloc 실패",
+            "서버 DB 는 교체됨(items 2→5) 그러나 응답 tag 0x3 예상 밖 — 클라 반영은 다음 진행 시", "서버 DB 는 교체됨(items 2→5) 그러나 send 실패(res 0x1)",
+            "team 3 훈련 챔피언 5명 기록(유지 1 · 삭제 2 · items 2→5 · delegated 1→0 · 유니캐스트 OK)",
+        ];
+        for r in reasons {
+            let s = server_text_with(&en, false, &format!("{RES_TAG}\tfail\t{r}"));
+            assert!(!has_hangul(&s) && s.matches('?').count() == r.matches('?').count(), "번역 누락: {r} → {s}");
+        }
+        for m in ["ok\t5\t3\t0", "ok\t5\t3\t2", "none\t4", "no_team", "panic"] { let s = server_text_with(&en, false, &format!("{RES_TAG}\t{m}")); assert!(!has_hangul(&s) && !s.contains('{'), "{m} → {s}"); }
+        assert_eq!(training_plan::reason_en("새 문구 0x1 미정"), "? ? 0x1 ?");
+    }
+    /// 내장 사본 = tvp.i18n ko/en 값과 같은지 + 옛 i18n(새 키 없음)일 때도 문구가 나오는지.
+    #[test]
+    fn builtin_matches_i18n_and_covers_stale_file() {
+        let v = i18n();
+        for k in ["err_no_team", "err_panic", "error", "result_none", "result_ok", "result_ok_nopos"] {
+            assert_eq!(Some(v["ko"]["training_view_plus"][k].as_str().unwrap()), builtin(k, true), "ko {k}");
+            assert_eq!(Some(v["en"]["training_view_plus"][k].as_str().unwrap()), builtin(k, false), "en {k}");
+        }
+        let stale = |k: &str| k.to_string(); // 옛 i18n = 키 이름이 그대로 돌아온다
+        assert_eq!(server_text_with(stale, true, &format!("{RES_TAG}\tok\t5\t3\t2")), "적용 완료: 설정 5명 · 팀 훈련 따름 3명 (포지션 미확인 2명 제외)");
+        assert_eq!(server_text_with(stale, false, &format!("{RES_TAG}\tfail\tHeapAlloc 실패")), "Error: HeapAlloc failed");
+    }
+}

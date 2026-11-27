@@ -1,0 +1,16 @@
+[package]
+name = "battle_lab_host"
+version = "0.0.1"
+edition = "2021"
+description = "TFM2 battle_lab: game exe as a library — loader prototype"
+
+[[bin]]
+name = "battle_lab_host"
+path = "src/main.rs"
+
+[dependencies]
+
+[workspace]
+
+[profile.release]
+opt-level = 1

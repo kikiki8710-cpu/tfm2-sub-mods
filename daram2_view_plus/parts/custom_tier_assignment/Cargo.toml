@@ -1,0 +1,25 @@
+[package]
+name = "custom_tier_assignment"
+version = "0.6.0"
+edition = "2021"
+
+# 0.6.0+: stable ABI port (mod-api-stable). classic source = tfm2-mods-main\custom_tier_assignment (daram2).
+# tiers are computed client-side (champion_brief + bundle champion_info sheet) and written server-side (team_set_json + unicast_team).
+# build: cargo build --release
+
+[lib]
+# rlib = integrated mod daram2_view_plus links this crate by path (2026-11-11). Standalone output is unchanged: target\release\<name>.dll.
+crate-type = ["cdylib", "rlib"]
+
+# embedded = integrated build only: turns off the entry export (declare_stable_mod!) and opens `embedded::init`;
+# files go to the integrated mod folder. Off by default -> standalone build is unaffected.
+[features]
+embedded = []
+
+[dependencies]
+mod-api-stable = { path = "../../../mod-api-stable" }
+serde_json = "1"
+
+
+[profile.release]
+opt-level = 1

@@ -1,0 +1,11 @@
+[package]
+name = "battle_lab"
+version = "0.1.3"
+edition = "2021"
+[[bin]]
+name = "battle_lab"
+path = "src/main.rs"
+[dependencies]
+[workspace]
+[profile.release]
+opt-level = 2

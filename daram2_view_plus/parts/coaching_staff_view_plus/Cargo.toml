@@ -1,0 +1,24 @@
+[package]
+name = "coaching_staff_view_plus"
+version = "0.6.0"
+edition = "2021"
+
+# 0.6.0+: stable ABI port (mod-api-stable + ui_kit_stable). classic source = tfm2-mods-main\coaching_staff_view_plus (daram2).
+# no .ui overrides any more - header/value columns are spawned at runtime with ui_spawn_source.
+# build: cargo build --release
+
+[lib]
+# rlib = integrated mod daram2_view_plus links this crate by path (2026-11-11). Standalone output is unchanged: target\release\<name>.dll.
+crate-type = ["cdylib", "rlib"]
+
+# embedded = integrated build only: turns off the entry export (declare_stable_mod!) and opens `embedded::init`;
+# files go to the integrated mod folder. Off by default -> standalone build is unaffected.
+[features]
+embedded = []
+
+[dependencies]
+mod-api-stable = { path = "../../../mod-api-stable" }
+
+
+[profile.release]
+opt-level = 1

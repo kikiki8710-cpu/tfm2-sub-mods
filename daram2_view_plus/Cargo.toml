@@ -1,0 +1,28 @@
+[package]
+name = "daram2_view_plus"
+version = "1.0.0"
+edition = "2021"
+
+# View Plus (Integrated) - daram2 View Plus 6 mods in one mod folder / one dll / one mod.mod_info (Steam Workshop = 1 item per folder).
+# banpick_view_plus is NOT included (2026-11-25, standalone only).
+# The 6 original crates stay buildable/deployable on their own; here they are linked by path as rlib with feature "embedded".
+# build: cargo build --release  -> target\release\daram2_view_plus.dll
+# package: python pack.py      -> ..\workshop\daram2_view_plus\package\daram2_view_plus\
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+mod-api-stable = { path = "../mod-api-stable" }
+training_view_plus = { path = "parts/training_view_plus", features = ["embedded"] }
+facility_view_plus = { path = "parts/facility_view_plus", features = ["embedded"] }
+custom_tier_assignment = { path = "parts/custom_tier_assignment", features = ["embedded"] }
+roster_view_plus = { path = "parts/roster_view_plus", features = ["embedded"] }
+coaching_staff_view_plus = { path = "parts/coaching_staff_view_plus", features = ["embedded"] }
+recruitment_view_plus = { path = "parts/recruitment_view_plus", features = ["embedded"] }
+
+[workspace]
+
+[profile.release]
+opt-level = 1
+overflow-checks = false

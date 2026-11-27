@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TFM2 전투 실험실</title>
+<link rel="stylesheet" href="/ui/style.css">
+</head>
+<body>
+<header>
+  <h1>전투 실험실</h1>
+  <label>세이브 <select id="save"></select></label>
+  <button id="reload" title="세이브·모드 목록 다시 읽기">새로 고침</button>
+  <button id="modsBtn">적용할 모드 <b id="modN">0</b></button>
+  <nav>
+    <button data-tab="replay" class="on">리플레이</button>
+    <button data-tab="custom">임의 경기</button>
+    <button data-tab="skill">스킬 실험실</button>
+    <button data-tab="rules">규칙 <b id="ruleN">0</b></button>
+  </nav>
+  <select id="lang" title="Language / 언어"><option value="ko">한국어</option><option value="en">English</option></select>
+</header>
+<main>
+  <section id="side">
+    <div id="tab-replay" class="tab"></div>
+    <div id="tab-custom" class="tab" hidden></div>
+    <div id="tab-skill" class="tab" hidden></div>
+    <div id="tab-rules" class="tab" hidden></div>
+  </section>
+  <section id="view">
+    <canvas id="cv"></canvas>
+    <div id="busy" hidden><div class="spin"></div><div id="busyT"></div><div id="busyBar" hidden><i></i></div><div id="busyS" class="dim"></div></div>
+    <div id="hud"><span id="score"></span><span id="clock"></span></div>
+    <div id="bar">
+      <button class="step" data-n="-60" title="1초 뒤로 (Shift+←)">−60</button><button class="step" data-n="-1" title="1틱 뒤로 (←)">◀ 1틱</button>
+      <button id="play" title="재생/멈춤 (스페이스)">재생</button>
+      <button class="step" data-n="1" title="1틱 앞으로 (→)">1틱 ▶</button><button class="step" data-n="60" title="1초 앞으로 (Shift+→)">+60</button>
+      <select id="speed"><option value="1">1배</option><option value="2">2배</option><option value="4">4배</option><option value="8">8배</option><option value="0.25">1/4배</option><option value="0.1">1/10배</option></select>
+      <input id="seek" type="range" min="0" max="0" value="0">
+      <label class="tk" title="틱 번호를 적고 Enter">틱 <input id="tickIn" type="number" min="0" value="0"><span id="tickMax" class="dim"></span></label>
+      <label><input type="checkbox" id="follow"> 선택 따라가기</label>
+      <span id="rngs" title="고른 선수(배치 화면에서는 시전자)의 사거리. 상대 챔피언의 중심이 원 안에 들어오면 닿습니다."><span class="dim">사거리</span><label style="color:#f2c14e"><input type="checkbox" class="rng" value="0">평타</label><label style="color:#7ed492"><input type="checkbox" class="rng" value="1">스킬1</label><label style="color:#7ab4ff"><input type="checkbox" class="rng" value="2">스킬2</label><label style="color:#ff8fe0"><input type="checkbox" class="rng" value="3">궁</label></span>
+      <span id="msg"></span>
+    </div>
+  </section>
+  <section id="info"><h2>선수</h2><div id="players"></div><h2>판단 이유</h2><div id="why" class="dim">선수를 고르고 「판단 기록」을 켠 경기에서 볼 수 있습니다.</div><h2>사건</h2><div id="events"></div></section>
+</main>
+<dialog id="modsDlg"><div id="modsHead"><h2>적용할 모드</h2><span><button id="modsOff">모두 끄기</button> <button id="modsClose">닫기</button></span></div><div id="modsBody"><p class="dim">챔피언 파일은 세이브에 같은 이름이 있으면 「교체」를 골라야 지금 파일의 내용이 쓰입니다. dll 모드는 앱 폴더(modgame)의 사본으로 올리고, 시뮬레이터가 게임인 것처럼 환경을 꾸며 줍니다. 무엇이 바뀌었는지는 실행 뒤 「사건」에 나옵니다.</p><div id="modsList"></div></div></dialog>
+<script src="/ui/app.js"></script>
+</body>
+</html>

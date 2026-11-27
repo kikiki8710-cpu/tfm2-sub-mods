@@ -1,0 +1,378 @@
+//! ui_inject — comp_test(조합 테스트) 아이템칸에 "모드 소유" 드롭다운 오버레이 주입.
+//!
+//! 왜 오버레이인가:
+//!   네이티브 #item0/1/2 드롭다운은 클릭이 카테고리 0~6 으로만 커밋된다(모드템 id>=30 표현 불가,
+//!   ghidra-re 확증 + item_tactics 개인전술에서 동일 결론). 그래서 네이티브 위에 모드 소유
+//!   드롭다운을 append 로 덮어 클릭을 가로채고, 선택값은 모드 자체 저장소에 보관한다.
+//!   (append = 나중 child = 상단 렌더 + 상단 히트)
+//!
+//! 주입 대상: training.ui  #comp_test_popup → #builds → #blue0..4 / #red0..4
+//!   각 행의 네이티브 item0/1/2 는 x=146/296/446 (width 140) → 같은 자리에 ct_i{0,1,2}_{행} 을 덮는다.
+//!
+//! ⚠ item_tactics 의 4칸 모드(MODE4)가 켜지면 같은 training 행을 replace_children 으로 통째 재구성한다.
+//!   그 경우 이 오버레이가 지워지므로 순서/체인 조율이 필요(현재 4items.cfg = slots 3 이라 비활성).
+//! ⚠ 로더 훅은 체인 방식(진입부 현재 12B 를 트램폴린에 담아 보존) — 다른 모드 훅 위에 얹힌다.
+#![allow(dead_code)]
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+// 엔진 함수 (**0.5.2**) — item_tactics/ai_adjust/draft_overlay 공용 확정값
+//
+// ★★0.5.2 최대 소득 = **잠복 버그 동시 수정**. 0.5.1에서 asset-get `.ui` 로더는 바이트동일 copy로 분화돼
+//   있었는데, 이 파일의 종전 주석("0x40f3d0 = ...training 계열 / 0xeb17d0 = strategy 전용이라 제거")은
+//   **사실과 반대**였다. 0.5.1 exe string-xref 실측:
+//     "asset/base/ui/layout/training" → **0xeb17d0 ×12**  (0x40f3d0 = 0건)
+//     "asset/base/ui/layout/main"     → 0x40f3d0 ×17
+//     "asset/base/ui/layout/strategy" → 0xeb17d0 ×2
+//   ⇒ training은 **0xeb17d0을 탄다**. "strategy 전용이라 불필요"라며 그 훅을 제거한 시점부터 0.5.1에서
+//   **comp_test 드롭다운 오버레이 주입이 죽어 있었다**(07-21 인게임 검증은 양쪽 다 훅하던 때의 결과).
+//
+// ★0.5.2에선 그 copy 분화가 **단일 0x5ac950으로 수렴**(main 17 / strategy 2 / training 12 전부 같은 타깃).
+//   ⇒ LOADER_RVA를 0x5ac950으로 두면 마이그와 위 회귀 수정이 동시에 된다. **세컨드 훅 추가 금지**
+//   (같은 주소에 두 번 걸면 자기체인 = 본문 2회 실행). 타 세션 3건(ai_adjust·item_tactics·serpen)과 교차확증.
+// ★0.5.3(2026-07-29~30): 0.5.2 0x5ac950 → **0x2e1550**. 문자열-xref 로 확정
+//   ('asset/base/ui/layout/{main,strategy,training,banpick}' lea 직후 call 이 만장일치로 수렴).
+//   ⛔자동매칭 표의 "확정 0x91ab0" 은 **오답**(clone family 형제 혼동) — 0.5.3 은 진입 24B 가 449개
+//   함수와 동일해 바이트로 형제를 못 가른다. 결정적 지문 = 콜러 수(0.5.2 507 ↔ 0.5.3 511 vs 오답 2).
+const LOADER_RVA: usize = 0x3b4100; // 0.5.6 재핀        // ★0.5.5(구0.5.4=0x2e35d0) 문자열-xref 31표(§7.5)·프롤로그 바이트동일·함수경계 유효 // 0.5.4(구0.5.3=0x2e1550)
+const PARSER_RVA: usize = 0x1fedb0; // 0.5.6 재핀        // ★0.5.5(구0.5.4=0x1a3ce0) skeleton UNIQUE·크기 2192B 동일 // 0.5.4(구0.5.3=0x1a6530) 3인자 계약·노드 stride 0x90 유지
+// 0.5.3: __rust_alloc 이 align별 심 + impl 로 분해 ⟹ impl 직접호출 **3인자**가 전 모드 정본.
+//   (rcx 무시, rdx=flags(0), r8=size) -> rax, 실패 시 0. ⛔align8 심은 OOM 시 abort 라 미채택.
+const ALLOC_RVA: usize = 0x366b180; // 0.5.6 재핀        // ★0.5.5(구0.5.4=0x29bb920) skeleton UNIQUE·60B 동일 // 0.5.4(구0.5.3=0x28f7df0) HeapAlloc 래퍼
+const NT_SIZE: usize = 0x90;               // NodeTemplate 크기 — 0.5.2 struct 오프셋 불변(CASE-불변)이라 유지
+
+const PATH_TRAIN: &[u8] = b"asset/base/ui/layout/training";
+
+// 행 id (blue0..4 = 블루 pos0~4, red0..4 = 레드 pos0~4) — 결과창 슬롯 순서와 동일 체계
+pub const ROWS: [&str; 10] = ["blue0", "blue1", "blue2", "blue3", "blue4",
+                              "red0", "red1", "red2", "red3", "red4"];
+// 오버레이 좌표 = **템플릿 생성 시점에 한 번만** 결정. 런타임 write 금지.
+//   ⛔런타임에 레이아웃 블록(+0x84 계열)만 덮어쓰면 screen_x(+0x240)가 안 따라와 시각/히트 박스가
+//     어긋나 **클릭이 관통**하고, 매 프레임 덮어쓰면 게임과 싸워 **떨림**이 생긴다(2026-07-21 실측).
+//   레이아웃: 4칸 모드(item_tactics) = x146/258/370 · w104 (it4_slot3=482) / 바닐라 3칸 = x146/296/446 · w140.
+//   선택 = comptest_items.cfg 의 `layout = 3|4` (기본 4). 변경 시 게임 재시작 필요(4items.cfg 와 동일 제약).
+pub static LAYOUT4: AtomicBool = AtomicBool::new(true);
+const ITEM_X4: [u32; 3] = [146, 258, 370];
+const ITEM_X3: [u32; 3] = [146, 296, 446];
+
+fn item_x(j: usize) -> u32 { if LAYOUT4.load(Ordering::Relaxed) { ITEM_X4[j] } else { ITEM_X3[j] } }
+fn item_w() -> u32 { if LAYOUT4.load(Ordering::Relaxed) { 104 } else { 140 } }
+
+/// 모드 소유 드롭다운 노드 텍스트. id 는 반드시 모드 접두(ct_) — 멱등 마커 오판·타모드 충돌 방지.
+// ⚠ append_child 용 조각은 id 앞에 `#` 을 붙이지 않는다(붙이면 파서 실패 → 주입 0).
+//   `#id:type` 형태는 replace_children(행 자식 전체 재작성)에서만 쓰는 문법. (item_tactics mod_dd/COL4 대조)
+fn ct_dd(id: &str, x: u32) -> String {
+    let w = item_w();
+    format!("{}:dropdown {{ @\"asset/base/style/main#dropdown\"; x: {}px; y: 10px; width: {}px; \
+height: 36px; text: {{ size: 12; }} item_text: {{ size: 12; }} \
+text_layout: {{ x: 6px; y: 5px; width: {}px; height: 26px; }} \
+item_layout: {{ x: 2px; y: 0px; width: {}px; height: 36px; }} \
+item_text_layout: {{ x: 6px; y: 5px; width: {}px; height: 26px; }} max_items_height: 252; }}",
+        id, x, w, w - 32, w - 4, w - 32)
+}
+
+/// 슬롯(0~9) + 칸(0~2) → 드롭다운 노드 id
+pub fn dd_id(slot: usize, item: usize) -> String { format!("ct_i{}_{}", item, ROWS[slot]) }
+
+/// ★킬스코어 현황 오버레이 조각(2026-08-08) — 병렬 실행 중 경기 N개의 점수·진행률을 한 화면에.
+///   게임의 로딩 진행바는 "결과 도착 후 1.4초 연출"이라 병렬에선 의미가 없다(모드가 숨기고 이걸 띄운다).
+///   ⚠append_child 조각이므로 최상위 id에 `#` 금지. 좌표는 `comp_test_popup`(1280x680) 기준 절대값.
+// ★모드가 주입하는 라벨은 전부 **볼드**(게임 `#bold_label` 스타일 재사용 — 유저 요청 2026-08-08).
+fn ct_label_at(id: &str, x: u32, y: u32, w: u32, size: u32) -> String {
+    format!("{}:label {{ @\"asset/base/style/main#bold_label\"; visible: false; \
+x: {}px; y: {}px; width: {}px; height: 30px; align_x: Center; align_y: Center; \
+text: \"\"; size: {}; }}", id, x, y, w, size)
+}
+fn ct_label(id: &str, y: u32, size: u32) -> String { ct_label_at(id, 240, y, 800, size) }
+pub fn ks_id(i: usize) -> String { format!("ct_ks{}", i) }
+pub const KS_MSG_ID: &str = "ct_ksmsg";
+// 최대 10경기(20은 CPU 부하로 실용성 없음 — 유저 실측). 한 열로 세운다.
+pub const KS_MAX: usize = 10;
+pub const KS_COL: usize = 10;
+fn ks_pos(i: usize) -> (u32, u32) { (240, 196 + (i as u32) * 34) }
+
+/// ★기록탭 범위 토글 — 게임의 준비/기록 토글(`popup_tabs`)과 **같은 모양**으로 만든다.
+///   `.ui` 원본(L1485~1528)의 `color` 컨테이너 + `color_selectable` 2개 구조를 그대로 복제.
+///   위치 = 탭(y18~58)과 기록 스크롤(y112~) 사이 빈 구간(y62).
+pub const HS_LAST_ID: &str = "ct_hs_last";
+pub const HS_ALL_ID: &str = "ct_hs_all";
+pub const HS_BOX_ID: &str = "ct_hs_box";
+// 이번 회차 승패 집계 — 한 라벨엔 색을 하나만 줄 수 있어 **3조각**으로 나눈다
+//   (블루 쪽은 우측정렬, 구분자는 중앙, 레드 쪽은 좌측정렬 → 가운데 정렬처럼 보인다).
+// 팀 이름은 팀 색, **숫자는 흰색** ⟹ 5조각으로 나눈다(라벨 하나에 색은 하나뿐).
+pub const WL_BL_ID: &str = "ct_wl_bl";   // "블루"  (청록)
+pub const WL_BN_ID: &str = "ct_wl_bn";   // 블루 승수 (흰색)
+pub const WL_C_ID: &str = "ct_wl_c";     // ":"     (회색)
+pub const WL_RN_ID: &str = "ct_wl_rn";   // 레드 승수 (흰색)
+pub const WL_RL_ID: &str = "ct_wl_rl";   // "레드"  (빨강)
+pub const COL_BLUE: u32 = 0x37d5b3ff;   // 게임 블루(청록)
+pub const COL_RED: u32 = 0xeb3d4dff;    // 게임 레드
+pub const COL_DIM: u32 = 0xc2c6ceff;    // 기본 회색
+pub const COL_WHITE: u32 = 0xffffffff;
+fn ct_label_align(id: &str, x: u32, y: u32, w: u32, size: u32, align: &str) -> String {
+    format!("{}:label {{ @\"asset/base/style/main#bold_label\"; visible: false; \
+x: {}px; y: {}px; width: {}px; height: 30px; align_x: {}; align_y: Center; \
+text: \"\"; size: {}; }}", id, x, y, w, align, size)
+}
+// 문구 = crate::t("hs_last"/"hs_all") — ko 는 원래 "테스트 결과"/"모든 결과" 그대로, 그 밖의 언어는 영어(i18n 2026-11-11).
+fn ct_scope_toggle() -> String {
+    format!("{}:color {{ visible: false; x: 820px; y: 62px; width: 372px; height: 40px; \
+padding: {{ left: 4px; right: 4px; top: 4px; bottom: 4px; }} \
+color: #4a4c56ff; stroke: 1; back_color: #00000000; \
+rounding: Uniform {{ rounding: 8; }} \
+child_type: LeftToRight {{ spacing: 0px; }} \
+#{}:color_selectable {{ @\"asset/base/style/main#strategy_option\"; width: 182px; height: 32px; \
+label: {{ size: 16; }} selected_label: {{ size: 16; }} text: \"{}\"; }} \
+#{}:color_selectable {{ @\"asset/base/style/main#strategy_option\"; width: 182px; height: 32px; \
+label: {{ size: 16; }} selected_label: {{ size: 16; }} text: \"{}\"; }} }}",
+        HS_BOX_ID, HS_LAST_ID, crate::t("hs_last"), HS_ALL_ID, crate::t("hs_all"))
+}
+/// 범위 토글을 스폰할 때의 언어(0 = 아직 스폰 안 함 / 1 = ko / 2 = 그 밖). 스폰 뒤 게임 언어가 바뀌면
+///   scope_tick 이 토글 문구만 다시 쓴다(라벨류는 매 프레임 label_set 이라 자동으로 따라간다).
+pub static SPAWN_LANG: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// ★경기 수 선택 — 준비 화면에서 1~10을 즉석으로 고른다.
+///   ⚠**드롭다운(`:dropdown`)은 쓸 수 없다**: `.ui`에 항목(items)을 선언하는 문법이 없고 게임 코드가
+///   런타임에 채우는 구조라, 모드가 주입한 드롭다운은 **목록이 빈 채로 뜬다**(게임 `#athlete:dropdown`
+///   선언 확인 — items 없음). ⟹ **−/+ 버튼 + 숫자 라벨**로 구현한다(1~10 전체를 두 번 클릭 안에 커버).
+// 두 벌을 만든다 — 준비 화면(page 0)용과 전술 화면(page 3)용. 화면마다 레이아웃이 달라
+//   같은 노드를 옮겨 쓸 수 없다(런타임 좌표 write 금지 = 히트박스가 안 따라옴).
+pub const RUNS_DEC_ID: [&str; 2] = ["ct_runs_dec0", "ct_runs_dec1"];
+pub const RUNS_INC_ID: [&str; 2] = ["ct_runs_inc0", "ct_runs_inc1"];
+pub const RUNS_VAL_ID: [&str; 2] = ["ct_runs_val0", "ct_runs_val1"];
+pub const RUNS_BOX_ID: [&str; 2] = ["ct_runs_box0", "ct_runs_box1"];
+fn ct_runs_picker(i: usize, x: u32, y: u32) -> String {
+    format!("{}:color {{ visible: false; x: {}px; y: {}px; width: 300px; height: 34px; \
+color: #4a4c56ff; stroke: 1; back_color: #00000000; rounding: Uniform {{ rounding: 8; }} \
+#{}:color_selectable {{ @\"asset/base/style/main#strategy_option\"; x: 4px; y: 3px; \
+width: 44px; height: 28px; label: {{ size: 16; }} selected_label: {{ size: 16; }} text: \"-\"; }} \
+#{}:label {{ @\"asset/base/style/main#label\"; x: 52px; y: 3px; width: 196px; height: 28px; \
+align_x: Center; align_y: Center; text: \"\"; size: 15; }} \
+#{}:color_selectable {{ @\"asset/base/style/main#strategy_option\"; x: 252px; y: 3px; \
+width: 44px; height: 28px; label: {{ size: 16; }} selected_label: {{ size: 16; }} text: \"+\"; }} }}",
+        RUNS_BOX_ID[i], x, y, RUNS_DEC_ID[i], RUNS_VAL_ID[i], RUNS_INC_ID[i])
+}
+
+/// comp_test_popup 에 킬스코어 라벨 KS_MAX개 + 상태 라벨 1개 주입(멱등).
+unsafe fn inject_killscore(r: usize) -> bool {
+    if r <= 0x10000 { return false; }
+    if find_tmpl(r, b"ct_ksmsg", 0) != 0 { return true; }       // 멱등 마커
+    let mut n = 0;
+    // 상태 메시지(맨 위) — "경기 진행 중" / "결과 정리 중 k/N"
+    if append_child(r, b"comp_test_popup", &ct_label(KS_MSG_ID, 150, 20)) { n += 1; }
+    for i in 0..KS_MAX {
+        let (x, y) = ks_pos(i);
+        // 폭 800 = 상태 메시지와 같은 폭이라 가운데 정렬이 서로 맞는다(폭 500이면 왼쪽으로 쏠림).
+        let txt = ct_label_at(&ks_id(i), x, y, 800, 17);
+        if append_child(r, b"comp_test_popup", &txt) { n += 1; }
+    }
+    // 기록탭 범위 토글(테스트 결과 / 모든 결과)
+    if append_child(r, b"comp_test_popup", &ct_scope_toggle()) { n += 1; }
+    // 이번 회차 승패 집계("블루 N : M 레드") — 토글 왼쪽 빈 자리
+    //   ★구분자 ":"가 **팝업 정중앙(1280/2 = 640)** 에 오도록 잡는다:
+    //     블루 조각 290~620(우측정렬) · ":" 620~660(중앙 = 640) · 레드 조각 660~990(좌측정렬).
+    //   글자 19 = 기존 17 + 2.
+    //   조각 배치(중앙 640 대칭): 블루라벨 300~555 / 블루숫자 560~615 / ":" 620~660 /
+    //                              레드숫자 665~720 / 레드라벨 725~980
+    if append_child(r, b"comp_test_popup", &ct_label_align(WL_BL_ID, 300, 59, 255, 19, "Right")) { n += 1; }
+    if append_child(r, b"comp_test_popup", &ct_label_align(WL_BN_ID, 560, 59, 55, 19, "Right")) { n += 1; }
+    if append_child(r, b"comp_test_popup", &ct_label_align(WL_C_ID, 620, 59, 40, 19, "Center")) { n += 1; }
+    if append_child(r, b"comp_test_popup", &ct_label_align(WL_RN_ID, 665, 59, 55, 19, "Left")) { n += 1; }
+    if append_child(r, b"comp_test_popup", &ct_label_align(WL_RL_ID, 725, 59, 255, 19, "Left")) { n += 1; }
+    // 경기 수 선택(−/+) 2벌:
+    //   [0] 준비 화면 — "챔피언 선택" 버튼(x673,y565) **위**
+    //   [1] 전술 화면 — 팀 전술 블록(#strategy y160~616) 아래, 개인 전술 위의 오른쪽
+    //   (좌표는 인게임 실측으로 미세조정 — 유저 확인 2026-08-08)
+    if append_child(r, b"comp_test_popup", &ct_runs_picker(0, 955, 498)) { n += 1; }
+    if append_child(r, b"comp_test_popup", &ct_runs_picker(1, 957, 654)) { n += 1; }
+    KS_INJECTED.store(n, Ordering::Relaxed);
+    n > 0
+}
+pub static KS_INJECTED: AtomicUsize = AtomicUsize::new(0);
+
+static BASE: AtomicUsize = AtomicUsize::new(0);
+static TRAMP: AtomicUsize = AtomicUsize::new(0);
+static INSTALLED: AtomicBool = AtomicBool::new(false);
+static LAST_TRAIN: AtomicUsize = AtomicUsize::new(0);
+pub static INJECTED: AtomicUsize = AtomicUsize::new(0);   // 주입 성공 노드 수(진단)
+// ── 진단 계측: 어디서 막혔는지 단계별로 ──
+pub static INSTALL_OK: AtomicUsize = AtomicUsize::new(0);   // 0.5.2=로더 단일수렴이라 0=미설치 / 1=설치(~~구 3=copy 둘 다~~)
+pub static LOADER_CALLS: AtomicUsize = AtomicUsize::new(0); // 로더 훅 발화 총 횟수
+pub static TRAIN_SEEN: AtomicUsize = AtomicUsize::new(0);   // 경로에 "training" 포함
+pub static PATH_HIT: AtomicUsize = AtomicUsize::new(0);     // PATH_TRAIN 정확 일치
+pub static ROWS_FOUND: AtomicUsize = AtomicUsize::new(0);   // find_tmpl 로 찾은 행 수
+pub static SEEN_PATHS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+type LoaderFn = extern "win64" fn(usize, *const u8, usize) -> usize;
+type ParserFn = extern "win64" fn(*mut u8, *const u8, usize);
+type AllocFn = extern "win64" fn(usize, usize, usize) -> usize; // 0.5.3: (무시, flags, size)
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn VirtualAlloc(a: usize, s: usize, t: u32, p: u32) -> usize;
+    fn VirtualProtect(a: usize, s: usize, p: u32, o: *mut u32) -> i32;
+    fn FlushInstructionCache(h: usize, a: usize, s: usize) -> i32;
+    fn GetCurrentProcess() -> usize;
+    fn GetModuleHandleW(m: *const u16) -> usize;
+}
+const MEM_CR: u32 = 0x1000 | 0x2000;
+const RWX: u32 = 0x40;
+
+/// 템플릿 트리에서 id 로 노드 찾기
+unsafe fn find_tmpl(node: usize, target: &[u8], depth: usize) -> usize {
+    if node <= 0x10000 || depth > 12 { return 0; }
+    let idptr = *((node + 0x08) as *const usize);
+    let idlen = *((node + 0x10) as *const usize);
+    if idlen == target.len() && idptr > 0x10000 {
+        if core::slice::from_raw_parts(idptr as *const u8, idlen) == target { return node; }
+    }
+    let cptr = *((node + 0x50) as *const usize);
+    let clen = *((node + 0x58) as *const usize);
+    if cptr > 0x10000 && clen < 1000 {
+        for i in 0..clen {
+            let f = find_tmpl(cptr + i * NT_SIZE, target, depth + 1);
+            if f != 0 { return f; }
+        }
+    }
+    0
+}
+
+/// container_id 컨테이너 끝에 노드 1개 append (자식 배열 재할당 — 옛 배열 leak 은 무해)
+unsafe fn append_child(root: usize, container_id: &[u8], text: &str) -> bool {
+    let base = BASE.load(Ordering::Relaxed);
+    if base == 0 { return false; }
+    let target = find_tmpl(root, container_id, 0);
+    if target == 0 { return false; }
+    let parser: ParserFn = core::mem::transmute(base + PARSER_RVA);
+    let mut out = [0u8; 0x400];
+    parser(out.as_mut_ptr(), text.as_ptr(), text.len());
+    let my = out.as_ptr().add(0x10) as usize;
+    if *(my as *const usize) == usize::MAX { return false; }
+    let ptr = *((target + 0x50) as *const usize);
+    let len = *((target + 0x58) as *const usize);
+    if len > 2000 { return false; }
+    let galloc: AllocFn = core::mem::transmute(base + ALLOC_RVA);
+    let new_n = len + 1;
+    let new_ptr = galloc(0, 0, new_n * NT_SIZE); // 0.5.3 impl 계약: rcx 무시·rdx=flags·r8=size
+    if new_ptr == 0 { return false; }
+    if ptr != 0 && len != 0 { core::ptr::copy_nonoverlapping(ptr as *const u8, new_ptr as *mut u8, len * NT_SIZE); }
+    core::ptr::copy_nonoverlapping(my as *const u8, (new_ptr + len * NT_SIZE) as *mut u8, NT_SIZE);
+    *((target + 0x50) as *mut usize) = new_ptr;
+    *((target + 0x48) as *mut usize) = new_n;
+    *((target + 0x58) as *mut usize) = new_n;
+    true
+}
+
+/// ★2026-07-22 유저 확정: 조합테스트 개인전술 아이템 드롭다운 = **tfm2_item_tactics 단독 소유**.
+///   두 모드가 같은 행(#blue0..4/#red0..4)에 각각 append 해서 **4px 어긋난 이중 박스**로 겹쳐 보이는
+///   문제(유저 제보 "4개일때 살짝 겹쳐져있어")를 해소. 런타임 실측으로 확인된 중복:
+///     네이티브 item0/1/2 = x146/296/446(w140, item_tactics가 매프레임 hide)
+///     item_tactics       = it4_s0~it4_slot3  x142/258/374/490(w110)  ← 4칸·모드템 = 상위호환
+///     이 모드            = ct_i0~2_<행>      x146/258/370            ← 3칸, 중복이라 끔
+///   ⚠ 이 상수를 false 로 두면 아래 선택 폴링(dd_selected→ITEM_OVERRIDE)도 노드 부재로 자연히
+///     조기탈출하므로, 이 모드의 comp_test **아이템 지정 기능 전체가 잠긴다**(선수 중복 해제 등
+///     다른 기능은 무관하게 그대로 동작). 되살리려면 이 상수만 true — 나머지 코드는 전부 보존.
+const ITEM_DD_ENABLED: bool = false;
+
+/// comp_test 10행 × 3칸에 모드 소유 드롭다운 오버레이 append. 이미 있으면 skip(멱등).
+unsafe fn inject_comptest(r: usize) -> bool {
+    if !ITEM_DD_ENABLED { return true; } // true=완료 취급(로더가 매 로드마다 재시도하지 않도록)
+    if r <= 0x10000 { return false; }
+    if find_tmpl(r, b"ct_i0_blue0", 0) != 0 { return true; }   // 멱등 마커(모드 접두 id)
+    let mut n = 0;
+    for (si, rid) in ROWS.iter().enumerate() {
+        if find_tmpl(r, rid.as_bytes(), 0) == 0 { continue; }
+        ROWS_FOUND.fetch_add(1, Ordering::Relaxed);
+        for j in 0..3 {
+            let txt = ct_dd(&dd_id(si, j), item_x(j));
+            if append_child(r, rid.as_bytes(), &txt) { n += 1; }
+        }
+    }
+    INJECTED.store(n, Ordering::Relaxed);
+    n > 0
+}
+
+fn loader_body(path: *const u8, len: usize, r: usize) {
+    // ★0.6.0 stable: 템플릿 주입은 하지 않는다(노드는 ensure_spawned 가 런타임 스폰). 진단 카운터만.
+    if path.is_null() || r <= 0x10000 || len >= 200 { return; }
+    let s = unsafe { core::slice::from_raw_parts(path, len) };
+    LOADER_CALLS.fetch_add(1, Ordering::Relaxed);
+    if s == PATH_TRAIN { PATH_HIT.fetch_add(1, Ordering::Relaxed); }
+}
+
+/// ★0.6.0 stable: comp_test 팝업 경로 아래에 모드 노드(킬스코어 라벨·범위 토글·승패 라벨·runs 피커)를 스폰(없을 때만).
+///   조각 문자열은 클래식 주입 조각 그대로(루트 id 에 `#` 없음 = ui_spawn_source 규약과 동일).
+pub fn ensure_spawned(ctx: &mut mod_api_stable::StableClient<'_>, popup: &str) {
+    let marker = format!("{}.{}", popup, KS_MSG_ID);
+    if ctx.ui_exists(&marker) { return; }
+    crate::lang_refresh(ctx);   // 스폰 직전 언어 재판정(토글 문구가 스폰 때 박힌다)
+    SPAWN_LANG.store(if crate::ko() { 1 } else { 2 }, Ordering::Relaxed);
+    let mut n = 0usize;
+    let mut frags: Vec<String> = Vec::new();
+    frags.push(ct_label(KS_MSG_ID, 150, 20));
+    for i in 0..KS_MAX { let (x, y) = ks_pos(i); frags.push(ct_label_at(&ks_id(i), x, y, 800, 17)); }
+    frags.push(ct_scope_toggle());
+    frags.push(ct_label_align(WL_BL_ID, 300, 59, 255, 19, "Right"));
+    frags.push(ct_label_align(WL_BN_ID, 560, 59, 55, 19, "Right"));
+    frags.push(ct_label_align(WL_C_ID, 620, 59, 40, 19, "Center"));
+    frags.push(ct_label_align(WL_RN_ID, 665, 59, 55, 19, "Left"));
+    frags.push(ct_label_align(WL_RL_ID, 725, 59, 255, 19, "Left"));
+    frags.push(ct_runs_picker(0, 955, 498));
+    frags.push(ct_runs_picker(1, 957, 654));
+    for f in &frags { if ctx.ui_spawn_source(popup, f) { n += 1; } }
+    KS_INJECTED.store(n, Ordering::Relaxed);
+    INJECTED.store(n, Ordering::Relaxed);
+    crate::uk::index_rebuild(ctx, popup);
+    crate::log(&format!("[uinj] comp_test_popup 스폰 {}/{} @{}
+", n, frags.len(), popup));
+}
+
+pub static ASSETS: AtomicUsize = AtomicUsize::new(0);
+
+extern "win64" fn detour(am: usize, path: *const u8, len: usize) -> usize {
+    if am > 0x10000 { ASSETS.store(am, Ordering::Relaxed); }
+    let t = TRAMP.load(Ordering::Relaxed);
+    if t == 0 { return 0; }
+    let r = unsafe { core::mem::transmute::<usize, LoaderFn>(t)(am, path, len) };
+    loader_body(path, len, r);
+    r
+}
+/// 체인 설치: 진입부 현재 12B(원본 프롤로그 or 다른 모드의 jmp)를 트램폴린에 담아 보존.
+unsafe fn install_one(base: usize, rva: usize, tramp_slot: &AtomicUsize, detour_addr: usize) -> bool {
+    let fn_addr = base + rva;
+    let mut cur = [0u8; 12];
+    core::ptr::copy_nonoverlapping(fn_addr as *const u8, cur.as_mut_ptr(), 12);
+    if cur[0] == 0x48 && cur[1] == 0xb8 {
+        let tgt = usize::from_le_bytes(cur[2..10].try_into().unwrap());
+        if tgt == detour_addr { return true; }   // 이미 내 훅
+    }
+    let stub = VirtualAlloc(0, 64, MEM_CR, RWX);
+    if stub == 0 { return false; }
+    let mut s: Vec<u8> = Vec::new();
+    s.extend_from_slice(&cur);
+    s.extend_from_slice(&[0x48, 0xb8]);
+    s.extend_from_slice(&(fn_addr + 0xc).to_le_bytes());
+    s.extend_from_slice(&[0xff, 0xe0]);
+    core::ptr::copy_nonoverlapping(s.as_ptr(), stub as *mut u8, s.len());
+    tramp_slot.store(stub, Ordering::Relaxed);
+    let mut patch = [0u8; 12];
+    patch[0] = 0x48; patch[1] = 0xb8;
+    patch[2..10].copy_from_slice(&detour_addr.to_le_bytes());
+    patch[10] = 0xff; patch[11] = 0xe0;
+    let mut old: u32 = 0;
+    if VirtualProtect(fn_addr, 12, RWX, &mut old) == 0 { return false; }
+    core::ptr::copy_nonoverlapping(patch.as_ptr(), fn_addr as *mut u8, 12);
+    VirtualProtect(fn_addr, 12, old, &mut old);
+    FlushInstructionCache(GetCurrentProcess(), fn_addr, 12);
+    true
+}
+
+pub unsafe fn install() -> bool {
+    if INSTALLED.swap(true, Ordering::Relaxed) { return true; }
+    let base = GetModuleHandleW(core::ptr::null());
+    if base == 0 { INSTALLED.store(false, Ordering::Relaxed); return false; }
+    BASE.store(base, Ordering::Relaxed);
+    let a = install_one(base, LOADER_RVA, &TRAMP, detour as usize);
+    INSTALL_OK.store(a as usize, Ordering::Relaxed);
+    if !a { INSTALLED.store(false, Ordering::Relaxed); return false; }
+    true
+}

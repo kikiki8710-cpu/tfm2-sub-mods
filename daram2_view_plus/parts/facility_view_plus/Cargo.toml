@@ -1,0 +1,25 @@
+[package]
+name = "facility_view_plus"
+version = "0.6.0"
+edition = "2021"
+
+# 0.6.0+: stable ABI port (mod-api-stable). classic source = tfm2-mods-main\facility_view_plus (daram2).
+# 0.6.0 merchandise = athlete x product_type records; bulk production is done server-side via team_set_json.
+# build: cargo build --release
+
+[lib]
+# rlib = integrated mod daram2_view_plus links this crate by path (2026-11-11). Standalone output is unchanged: target\release\<name>.dll.
+crate-type = ["cdylib", "rlib"]
+
+# embedded = integrated build only: turns off the entry export (declare_stable_mod!) and opens `embedded::init`;
+# files go to the integrated mod folder. Off by default -> standalone build is unaffected.
+[features]
+embedded = []
+
+[dependencies]
+mod-api-stable = { path = "../../../mod-api-stable" }
+serde_json = "1"
+
+
+[profile.release]
+opt-level = 1

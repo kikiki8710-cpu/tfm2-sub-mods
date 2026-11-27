@@ -1,0 +1,22 @@
+use anyhow::Result;
+use serde::Serialize;
+use std::{mem::size_of,time::Instant};
+use windows::{core::Interface,Win32::{Graphics::Direct3D11::*,System::{Threading::GetCurrentProcess,ProcessStatus::{GetProcessMemoryInfo,PROCESS_MEMORY_COUNTERS_EX}}}};
+use crate::log::Log;
+struct Query{disjoint:ID3D11Query,start:ID3D11Query,end:ID3D11Query,pending:bool}
+pub struct GpuTimer{queries:Vec<Query>,index:usize,active:Option<usize>}
+unsafe fn data<T:Default>(context:&ID3D11DeviceContext,query:&ID3D11Query)->windows::core::Result<Option<T>>{let mut result=T::default();let hr=(context.vtable().GetData)(context.as_raw(),query.as_raw(),(&mut result as *mut T).cast(),size_of::<T>()as u32,D3D11_ASYNC_GETDATA_DONOTFLUSH.0 as u32);if hr.0<0{return Err(hr.into());}Ok(if hr.0==0{Some(result)}else{None})}
+impl GpuTimer{
+ pub fn new(device:&ID3D11Device)->Result<Self>{let mut queries=Vec::new();for _ in 0..8{let make=|kind|->Result<ID3D11Query>{let mut q=None;unsafe{device.CreateQuery(&D3D11_QUERY_DESC{Query:kind,MiscFlags:0},Some(&mut q))?;}Ok(q.unwrap())};queries.push(Query{disjoint:make(D3D11_QUERY_TIMESTAMP_DISJOINT)?,start:make(D3D11_QUERY_TIMESTAMP)?,end:make(D3D11_QUERY_TIMESTAMP)?,pending:false});}Ok(Self{queries,index:0,active:None})}
+ pub fn begin(&mut self,context:&ID3D11DeviceContext)->Result<Option<f64>>{let i=self.index;self.index=(self.index+1)%self.queries.len();self.active=None;let q=&mut self.queries[i];let mut ms=None;if q.pending{unsafe{if let Some(d)=data::<D3D11_QUERY_DATA_TIMESTAMP_DISJOINT>(context,&q.disjoint)?{if let(Some(a),Some(b))=(data::<u64>(context,&q.start)?,data::<u64>(context,&q.end)?){if !d.Disjoint.as_bool()&&d.Frequency>0{ms=Some((b-a)as f64/d.Frequency as f64*1000.0);}q.pending=false;}}}}if !q.pending{unsafe{context.Begin(&q.disjoint);context.End(&q.start);}self.active=Some(i);}Ok(ms)}
+ pub fn end(&mut self,context:&ID3D11DeviceContext){if let Some(i)=self.active.take(){let q=&mut self.queries[i];unsafe{context.End(&q.end);context.End(&q.disjoint);}q.pending=true;}}
+}
+#[derive(Clone,Serialize)]pub struct Sample{pub elapsed_seconds:f64,pub frames:u64,pub fps:f64,pub cpu_mean_ms:f64,pub cpu_p95_ms:f64,pub gpu_mean_ms:Option<f64>,pub gpu_p95_ms:Option<f64>,pub draw_calls:u32,pub working_set_bytes:usize,pub private_bytes:usize,pub tick:f64,pub units:usize}
+pub fn memory()->(usize,usize){unsafe{let mut m=PROCESS_MEMORY_COUNTERS_EX{cb:size_of::<PROCESS_MEMORY_COUNTERS_EX>()as u32,..Default::default()};if GetProcessMemoryInfo(GetCurrentProcess(),(&mut m as *mut PROCESS_MEMORY_COUNTERS_EX).cast(),size_of::<PROCESS_MEMORY_COUNTERS_EX>()as u32).is_ok(){(m.WorkingSetSize,m.PrivateUsage)}else{(0,0)}}}
+pub struct Metrics{start:Instant,last:Instant,pub frames:u64,last_frames:u64,cpu:Vec<f64>,gpu:Vec<f64>,pub samples:Vec<Sample>}
+fn summary(values:&mut[f64])->(f64,f64){if values.is_empty(){return(0.0,0.0);}let mean=values.iter().sum::<f64>()/values.len()as f64;values.sort_by(f64::total_cmp);(mean,values[(values.len()*95/100).min(values.len()-1)])}
+impl Metrics{
+ pub fn new()->Self{Self{start:Instant::now(),last:Instant::now(),frames:0,last_frames:0,cpu:Vec::with_capacity(1600),gpu:Vec::with_capacity(1600),samples:Vec::with_capacity(256)}}
+ pub fn frame(&mut self,cpu:f64,gpu:Option<f64>){self.frames+=1;if self.cpu.len()<1600{self.cpu.push(cpu);}if let Some(g)=gpu{if self.gpu.len()<1600{self.gpu.push(g);}}}
+ pub fn report(&mut self,log:&Log,calls:u32,tick:f64,units:usize)->Option<Sample>{if self.last.elapsed().as_secs_f64()<5.0{return None;}let seconds=self.last.elapsed().as_secs_f64();let(cpu,p95)=summary(&mut self.cpu);let gpu=if self.gpu.is_empty(){None}else{Some(summary(&mut self.gpu))};let(ws,private)=memory();let sample=Sample{elapsed_seconds:self.start.elapsed().as_secs_f64(),frames:self.frames,fps:(self.frames-self.last_frames)as f64/seconds,cpu_mean_ms:cpu,cpu_p95_ms:p95,gpu_mean_ms:gpu.map(|x|x.0),gpu_p95_ms:gpu.map(|x|x.1),draw_calls:calls,working_set_bytes:ws,private_bytes:private,tick,units};log.line(format!("5초 지표 fps={:.1} frames={} CPU 평균={:.3}ms p95={:.3}ms GPU 평균={:?}ms p95={:?}ms draw={} tick={:.1} units={} workingSet={} private={}",sample.fps,sample.frames,cpu,p95,sample.gpu_mean_ms,sample.gpu_p95_ms,calls,tick,units,ws,private));if self.samples.len()<self.samples.capacity(){self.samples.push(sample.clone());}self.cpu.clear();self.gpu.clear();self.last=Instant::now();self.last_frames=self.frames;Some(sample)}
+}

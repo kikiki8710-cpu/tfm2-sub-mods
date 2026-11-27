@@ -1,0 +1,1 @@
+{"mod_id": "tfm2_vr_bridge", "name": "TFM2 VR", "author": "tfm2mods", "version": "0.1.1", "last_updated": "2026-11-27", "description": "Bridge for the TFM2 VR viewer (PC VR headset). It only copies the game's draw commands and changes nothing in the game. Run TFM2_VR.bat to start VR. Built for game 0.7.4.", "dependencies": [{"mod_id": "base", "version": ">=0.7.4, <0.7.5"}]}

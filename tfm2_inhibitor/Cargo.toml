@@ -1,0 +1,19 @@
+[package]
+name = "tfm2_inhibitor"
+version = "0.1.7"
+edition = "2021"
+
+# stable ABI shell (mod-api-stable) + exe RE (0.7.4). 설계·RE = F:\claude\tfm2\mods_report\tfm2_inhibitor\
+# build: cargo build --release  /  deploy: python F:\claude\tfm2mods\deploy_stable.py tfm2_inhibitor
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+mod-api-stable = { path = "../mod-api-stable" }
+
+[workspace]
+
+[profile.release]
+opt-level = 1
+overflow-checks = false

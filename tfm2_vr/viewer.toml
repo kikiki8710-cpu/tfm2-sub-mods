@@ -1,0 +1,13 @@
+# 네이티브 뷰어 설정. 프로그램을 다시 실행하면 적용됩니다.
+# OpenXR 권장 눈 해상도에 곱하며 런타임 최대 크기를 넘지 않습니다.
+render_scale = 1.4
+msaa_samples = 4
+hud_width = 2048
+minimum_line_pixels = 1.25
+
+ui_top = true
+ui_kill_log = true
+ui_player_panels = true
+ui_overhead = true
+ui_minimap = true
+ui_events = true

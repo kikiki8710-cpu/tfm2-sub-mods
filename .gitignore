@@ -1,0 +1,7 @@
+# copied from <game folder>\mod-sdk-stable (ships with the game)
+/mod-api-stable/
+target/
+*.dll
+*.exe
+*.pdb
+/_dist/
